@@ -1,0 +1,381 @@
+#!/bin/bash
+#
+# vcluster Management Script
+# Usage: ./vcluster-cluster <command> [options]
+
+set -euo pipefail
+
+DEFAULT_PREFIX="vcluster"
+
+check_vcluster() {
+    if ! command -v vcluster &> /dev/null; then
+        echo "ERROR: vcluster is not installed"
+        echo ""
+        echo "Install with:"
+        echo "  macOS:   brew install loft-sh/tap/vcluster"
+        echo "  Linux:   curl -L -o vcluster https://github.com/loft-sh/vcluster/releases/latest/download/vcluster-linux-amd64"
+        echo "           chmod +x vcluster && sudo mv vcluster /usr/local/bin/"
+        exit 1
+    fi
+}
+
+check_kubectl() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl is not installed"
+        exit 1
+    fi
+}
+
+cmd_create() {
+    local COUNT="${1:-10}"
+    local NAMESPACE_PREFIX="${2:-$DEFAULT_PREFIX}"
+    
+    check_vcluster
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating $COUNT virtual clusters..."
+    echo "Namespace prefix: $NAMESPACE_PREFIX"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    start_time=$(date +%s)
+    created=0
+    failed=0
+    
+    for i in $(seq 1 $COUNT); do
+      vc_name="vc-$(printf "%04d" $i)"
+      ns="${NAMESPACE_PREFIX}-$(printf "%04d" $i)"
+      
+      echo "[$i/$COUNT] Creating virtual cluster: $vc_name in namespace $ns..."
+      
+      if ! kubectl get namespace "$ns" &>/dev/null; then
+        kubectl create namespace "$ns" 2>/dev/null || true
+      fi
+      
+      if vcluster create "$vc_name" --namespace "$ns" --connect=false --update-current=false &>/dev/null; then
+        created=$((created + 1))
+        echo "  ✓ Created $vc_name"
+      else
+        failed=$((failed + 1))
+        echo "  ✗ Failed to create $vc_name"
+      fi
+      
+      if (( i % 5 == 0 )); then
+        wait
+        echo "  Progress: $i/$COUNT clusters processed..."
+      fi
+    done
+    
+    wait
+    
+    end_time=$(date +%s)
+    total_time=$((end_time - start_time))
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Summary:"
+    echo "  Created: $created"
+    echo "  Failed:  $failed"
+    echo "  Time:    ${total_time}s"
+    echo "════════════════════════════════════════════════════════════════"
+}
+
+cmd_verify() {
+    local NAMESPACE_PREFIX="${1:-$DEFAULT_PREFIX}"
+    
+    check_vcluster
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Verifying virtual clusters with prefix: $NAMESPACE_PREFIX"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    vcluster list
+}
+
+cmd_cleanup() {
+    local NAMESPACE_PREFIX="${1:-$DEFAULT_PREFIX}"
+    
+    check_vcluster
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Cleaning up virtual clusters with prefix: $NAMESPACE_PREFIX"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    vclusters=$(vcluster list --output json 2>/dev/null | jq -r '.[].Name' || echo "")
+    
+    if [ -z "$vclusters" ]; then
+        echo "No virtual clusters found"
+        exit 0
+    fi
+    
+    deleted=0
+    failed=0
+    
+    for vc in $vclusters; do
+      ns=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$vc\") | .Namespace" || echo "")
+      if [[ "$ns" == "${NAMESPACE_PREFIX}-"* ]]; then
+        echo "Deleting: $vc in namespace $ns..."
+        if vcluster delete "$vc" -n "$ns" &>/dev/null; then
+          deleted=$((deleted + 1))
+          echo "  ✓ Deleted $vc"
+        else
+          failed=$((failed + 1))
+          echo "  ✗ Failed to delete $vc"
+        fi
+      fi
+    done
+    
+    echo ""
+    echo "Summary:"
+    echo "  Deleted: $deleted"
+    echo "  Failed:  $failed"
+}
+
+cmd_list() {
+    check_vcluster
+    vcluster list
+}
+
+# Helper function to get vcluster kubeconfig and run kubectl command
+run_vcluster_kubectl() {
+    local VC_NAME=$1
+    local VC_NAMESPACE=$2
+    local RESOURCE_TYPE=$3
+    local NAMESPACE="${4:-}"
+    
+    # Get kubeconfig from vcluster using --print flag
+    TEMP_KUBECONFIG=$(mktemp)
+    
+    # Extract kubeconfig from vcluster connect --print output
+    # vcluster connect --print outputs the kubeconfig to stdout
+    if ! vcluster connect "$VC_NAME" -n "$VC_NAMESPACE" --print 2>/dev/null | grep -A 1000 "^apiVersion:" > "$TEMP_KUBECONFIG"; then
+        echo "ERROR: Could not get kubeconfig for vcluster: $VC_NAME in namespace $VC_NAMESPACE"
+        rm -f "$TEMP_KUBECONFIG"
+        return 1
+    fi
+    
+    # Check if we got valid kubeconfig
+    if [ ! -s "$TEMP_KUBECONFIG" ] || ! grep -q "^apiVersion:" "$TEMP_KUBECONFIG"; then
+        echo "ERROR: Invalid kubeconfig for vcluster: $VC_NAME"
+        rm -f "$TEMP_KUBECONFIG"
+        return 1
+    fi
+    
+    # Run kubectl command
+    if [ -n "$NAMESPACE" ]; then
+        kubectl --kubeconfig "$TEMP_KUBECONFIG" get "$RESOURCE_TYPE" -n "$NAMESPACE" 2>/dev/null || echo "No resources found in $NAMESPACE namespace."
+    else
+        kubectl --kubeconfig "$TEMP_KUBECONFIG" get "$RESOURCE_TYPE" --all-namespaces 2>/dev/null || echo "No resources found."
+    fi
+    
+    rm -f "$TEMP_KUBECONFIG"
+}
+
+# List namespaces in a vcluster
+cmd_ns() {
+    local VC_NAME="${1:-}"
+    
+    check_vcluster
+    check_kubectl
+    
+    if [ -z "$VC_NAME" ]; then
+        echo "ERROR: Usage: $0 ns <vcluster-name>"
+        echo ""
+        echo "Example:"
+        echo "  $0 ns vc-0001"
+        exit 1
+    fi
+    
+    # Get namespace from vcluster name
+    VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
+    
+    if [ -z "$VC_NAMESPACE" ]; then
+        echo "ERROR: vcluster not found: $VC_NAME"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Listing namespaces in vcluster: $VC_NAME (namespace: $VC_NAMESPACE)"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    run_vcluster_kubectl "$VC_NAME" "$VC_NAMESPACE" "namespaces"
+}
+
+# List pods in a vcluster
+cmd_pods() {
+    local VC_NAME="${1:-}"
+    local NAMESPACE="${2:-}"
+    
+    check_vcluster
+    check_kubectl
+    
+    if [ -z "$VC_NAME" ]; then
+        echo "ERROR: Usage: $0 pods <vcluster-name> [namespace]"
+        echo ""
+        echo "Examples:"
+        echo "  $0 pods vc-0001           # List pods in all namespaces"
+        echo "  $0 pods vc-0001 default   # List pods in specific namespace"
+        exit 1
+    fi
+    
+    # Get namespace from vcluster name
+    VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
+    
+    if [ -z "$VC_NAMESPACE" ]; then
+        echo "ERROR: vcluster not found: $VC_NAME"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    if [ -n "$NAMESPACE" ]; then
+        echo "Listing pods in vcluster: $VC_NAME (namespace: $NAMESPACE)"
+    else
+        echo "Listing pods in vcluster: $VC_NAME (all namespaces)"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+    
+    run_vcluster_kubectl "$VC_NAME" "$VC_NAMESPACE" "pods" "$NAMESPACE"
+}
+
+# List deployments in a vcluster
+cmd_deployment() {
+    local VC_NAME="${1:-}"
+    local NAMESPACE="${2:-}"
+    
+    check_vcluster
+    check_kubectl
+    
+    if [ -z "$VC_NAME" ]; then
+        echo "ERROR: Usage: $0 deployment <vcluster-name> [namespace]"
+        echo ""
+        echo "Examples:"
+        echo "  $0 deployment vc-0001           # List deployments in all namespaces"
+        echo "  $0 deployment vc-0001 default   # List deployments in specific namespace"
+        exit 1
+    fi
+    
+    # Get namespace from vcluster name
+    VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
+    
+    if [ -z "$VC_NAMESPACE" ]; then
+        echo "ERROR: vcluster not found: $VC_NAME"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    if [ -n "$NAMESPACE" ]; then
+        echo "Listing deployments in vcluster: $VC_NAME (namespace: $NAMESPACE)"
+    else
+        echo "Listing deployments in vcluster: $VC_NAME (all namespaces)"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+    
+    run_vcluster_kubectl "$VC_NAME" "$VC_NAMESPACE" "deployments" "$NAMESPACE"
+}
+
+# List services in a vcluster
+cmd_service() {
+    local VC_NAME="${1:-}"
+    local NAMESPACE="${2:-}"
+    
+    check_vcluster
+    check_kubectl
+    
+    if [ -z "$VC_NAME" ]; then
+        echo "ERROR: Usage: $0 service <vcluster-name> [namespace]"
+        echo ""
+        echo "Examples:"
+        echo "  $0 service vc-0001           # List services in all namespaces"
+        echo "  $0 service vc-0001 default   # List services in specific namespace"
+        exit 1
+    fi
+    
+    # Get namespace from vcluster name
+    VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
+    
+    if [ -z "$VC_NAMESPACE" ]; then
+        echo "ERROR: vcluster not found: $VC_NAME"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    if [ -n "$NAMESPACE" ]; then
+        echo "Listing services in vcluster: $VC_NAME (namespace: $NAMESPACE)"
+    else
+        echo "Listing services in vcluster: $VC_NAME (all namespaces)"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+    
+    run_vcluster_kubectl "$VC_NAME" "$VC_NAMESPACE" "services" "$NAMESPACE"
+}
+
+cmd_help() {
+    cat <<EOF
+vcluster Management
+
+Usage: $0 <command> [options]
+
+Commands:
+  create [COUNT] [PREFIX]    Create virtual clusters
+                            COUNT: Number of clusters (default: 10)
+                            PREFIX: Namespace prefix (default: vcluster)
+
+  verify [PREFIX]           Verify/list clusters
+                            PREFIX: Namespace prefix (default: vcluster)
+
+  cleanup [PREFIX]          Cleanup clusters
+                            PREFIX: Namespace prefix (default: vcluster)
+
+  list                      List all virtual clusters
+
+  ns VC_NAME                List namespaces in a specific vcluster
+                            VC_NAME: vcluster name (e.g., vc-0001)
+                            
+                            Example:
+                              $0 ns vc-0001
+
+  pods VC_NAME [NS]         List pods in a specific vcluster
+                            VC_NAME: vcluster name (e.g., vc-0001)
+                            NS: Optional namespace filter
+                            
+                            Examples:
+                              $0 pods vc-0001           # All namespaces
+                              $0 pods vc-0001 default   # Specific namespace
+
+  deployment VC_NAME [NS]   List deployments in a specific vcluster
+                            VC_NAME: vcluster name (e.g., vc-0001)
+                            NS: Optional namespace filter
+                            
+                            Examples:
+                              $0 deployment vc-0001           # All namespaces
+                              $0 deployment vc-0001 default   # Specific namespace
+
+  service VC_NAME [NS]      List services in a specific vcluster
+                            VC_NAME: vcluster name (e.g., vc-0001)
+                            NS: Optional namespace filter
+                            
+                            Examples:
+                              $0 service vc-0001           # All namespaces
+                              $0 service vc-0001 default   # Specific namespace
+
+  help                      Show this help message
+
+EOF
+}
+
+COMMAND="${1:-help}"
+
+case "$COMMAND" in
+    create) shift; cmd_create "$@" ;;
+    verify) shift; cmd_verify "$@" ;;
+    cleanup) shift; cmd_cleanup "$@" ;;
+    list) cmd_list ;;
+    ns) shift; cmd_ns "$@" ;;
+    pods) shift; cmd_pods "$@" ;;
+    deployment) shift; cmd_deployment "$@" ;;
+    service) shift; cmd_service "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *) echo "ERROR: Unknown command: $COMMAND"; cmd_help; exit 1 ;;
+esac
+

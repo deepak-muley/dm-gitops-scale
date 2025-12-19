@@ -1,0 +1,281 @@
+#!/bin/bash
+#
+# Paused CAPI Cluster Management Script
+# Usage: ./paused-capi-cluster <command> [options]
+#
+# Commands:
+#   create [COUNT] [NAMESPACE]    - Create paused CAPI clusters
+#   verify [NAMESPACE]            - Verify clusters
+#   cleanup [NAMESPACE]           - Cleanup clusters
+#   list [NAMESPACE]              - List all clusters
+#   help                          - Show this help message
+
+set -euo pipefail
+
+DEFAULT_NAMESPACE="dm-dev-workspace"
+DEFAULT_BATCH_SIZE=50
+
+# Check if kubectl is installed
+check_kubectl() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl is not installed"
+        exit 1
+    fi
+}
+
+# Create clusters
+cmd_create() {
+    local COUNT="${1:-10}"
+    local NAMESPACE="${2:-$DEFAULT_NAMESPACE}"
+    local BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_BATCH_SIZE}"
+    
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating $COUNT paused CAPI Cluster objects"
+    echo "Namespace: $NAMESPACE"
+    echo "Batch size: $BATCH_SIZE"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # Ensure namespace exists
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Creating namespace: $NAMESPACE"
+        kubectl create namespace "$NAMESPACE"
+    fi
+    
+    start_time=$(date +%s)
+    created=0
+    failed=0
+    
+    for i in $(seq 1 $COUNT); do
+      cluster_name="sim-cluster-$(printf "%04d" $i)"
+      
+      # Calculate unique CIDR blocks to avoid conflicts
+      pod_cidr_third=$((i / 256))
+      pod_cidr_fourth=$((i % 256))
+      
+      cat <<EOF | kubectl apply -f - 2>/dev/null &
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: $cluster_name
+  namespace: $NAMESPACE
+  annotations:
+    cluster.x-k8s.io/paused: "true"
+    simulation: "true"
+    created-at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  labels:
+    simulation: "true"
+    batch: "scale-test"
+    index: "$(printf "%04d" $i)"
+spec:
+  paused: true
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - "10.$pod_cidr_third.$pod_cidr_fourth.0/24"
+    services:
+      cidrBlocks:
+        - "10.96.0.0/12"
+    serviceDomain: cluster.local
+EOF
+
+      if [ $? -eq 0 ]; then
+        created=$((created + 1))
+      else
+        failed=$((failed + 1))
+      fi
+      
+      # Batch commits to avoid overwhelming API server
+      if (( i % BATCH_SIZE == 0 )); then
+        wait
+        elapsed=$(($(date +%s) - start_time))
+        if [ $elapsed -gt 0 ]; then
+          rate=$(echo "scale=2; $i / $elapsed" | bc 2>/dev/null || echo "N/A")
+          echo "Created $i/$COUNT clusters... (${rate} clusters/sec)"
+        fi
+      fi
+    done
+    
+    wait
+    
+    end_time=$(date +%s)
+    total_time=$((end_time - start_time))
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "✓ Created $created clusters in ${total_time} seconds"
+    if [ $failed -gt 0 ]; then
+        echo "  Failed: $failed"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+}
+
+# Verify clusters
+cmd_verify() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Verifying paused CAPI clusters in namespace: $NAMESPACE"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Namespace $NAMESPACE does not exist"
+        exit 1
+    fi
+    
+    total_clusters=$(kubectl get clusters -n "$NAMESPACE" -l simulation=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    
+    echo ""
+    echo "Total clusters: $total_clusters"
+    echo ""
+    
+    if [ "$total_clusters" -gt 0 ]; then
+        echo "Sample clusters (first 10):"
+        kubectl get clusters -n "$NAMESPACE" -l simulation=true --no-headers | head -10
+        if [ "$total_clusters" -gt 10 ]; then
+            echo "  ... and $((total_clusters - 10)) more"
+        fi
+    fi
+    
+    echo ""
+    echo "Cluster status breakdown:"
+    kubectl get clusters -n "$NAMESPACE" -l simulation=true -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}' 2>/dev/null | head -20 || echo "  (Status not available)"
+}
+
+# Cleanup clusters
+cmd_cleanup() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Deleting all simulated clusters in namespace: $NAMESPACE"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # Check if namespace exists
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Namespace $NAMESPACE does not exist. Nothing to cleanup."
+        exit 0
+    fi
+    
+    # Count clusters before deletion
+    before_count=$(kubectl get clusters -n "$NAMESPACE" -l simulation=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    
+    if [ "$before_count" -eq 0 ]; then
+        echo "No simulated clusters found in namespace $NAMESPACE"
+        exit 0
+    fi
+    
+    echo "Found $before_count clusters to delete"
+    echo ""
+    
+    # Delete all simulated clusters
+    kubectl delete clusters -n "$NAMESPACE" -l simulation=true --wait=false
+    
+    echo "✓ Deletion initiated (running in background)"
+    echo ""
+    echo "Monitor progress with:"
+    echo "  watch -n 1 'kubectl get clusters -n $NAMESPACE -l simulation=true --no-headers | wc -l'"
+}
+
+# List clusters
+cmd_list() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Paused CAPI Clusters in namespace: $NAMESPACE"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Namespace $NAMESPACE does not exist"
+        exit 1
+    fi
+    
+    total=$(kubectl get clusters -n "$NAMESPACE" -l simulation=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    echo "Total clusters: $total"
+    echo ""
+    
+    if [ "$total" -gt 0 ]; then
+        kubectl get clusters -n "$NAMESPACE" -l simulation=true
+    else
+        echo "No clusters found"
+    fi
+}
+
+# Show help
+cmd_help() {
+    cat <<EOF
+Paused CAPI Cluster Management
+
+Usage: $0 <command> [options]
+
+Commands:
+  create [COUNT] [NAMESPACE]    Create paused CAPI clusters
+                               COUNT: Number of clusters (default: 10)
+                               NAMESPACE: Kubernetes namespace (default: dm-dev-workspace)
+                               
+                               Examples:
+                                 $0 create              # Create 10 clusters
+                                 $0 create 100         # Create 100 clusters
+                                 $0 create 50 my-ns    # Create 50 in custom namespace
+                                 BATCH_SIZE=20 $0 create 1000  # Custom batch size
+
+  verify [NAMESPACE]           Verify clusters
+                               NAMESPACE: Kubernetes namespace (default: dm-dev-workspace)
+                               
+                               Examples:
+                                 $0 verify
+                                 $0 verify my-namespace
+
+  cleanup [NAMESPACE]          Cleanup clusters
+                               NAMESPACE: Kubernetes namespace (default: dm-dev-workspace)
+                               
+                               Examples:
+                                 $0 cleanup
+                                 $0 cleanup my-namespace
+
+  list [NAMESPACE]             List all clusters
+                               NAMESPACE: Kubernetes namespace (default: dm-dev-workspace)
+
+  help                         Show this help message
+
+EOF
+}
+
+# Main command dispatcher
+COMMAND="${1:-help}"
+
+case "$COMMAND" in
+    create)
+        shift
+        cmd_create "$@"
+        ;;
+    verify)
+        shift
+        cmd_verify "$@"
+        ;;
+    cleanup)
+        shift
+        cmd_cleanup "$@"
+        ;;
+    list)
+        shift
+        cmd_list "$@"
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        echo "ERROR: Unknown command: $COMMAND"
+        echo ""
+        cmd_help
+        exit 1
+        ;;
+esac
+

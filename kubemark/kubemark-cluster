@@ -1,0 +1,245 @@
+#!/bin/bash
+#
+# Kubemark Management Script
+# Usage: ./kubemark-cluster <command> [options]
+
+set -euo pipefail
+
+NAMESPACE="kubemark"
+KUBEMARK_VERSION="${KUBEMARK_VERSION:-v1.28.0}"
+
+check_kubectl() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl is not installed"
+        exit 1
+    fi
+}
+
+cmd_setup() {
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Setting up Kubemark namespace and secrets"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Creating namespace: $NAMESPACE"
+        kubectl create namespace "$NAMESPACE"
+    else
+        echo "Namespace $NAMESPACE already exists"
+    fi
+    
+    if ! kubectl get secret kubeconfig -n "$NAMESPACE" &>/dev/null; then
+        echo "Creating kubeconfig secret..."
+        KUBECONFIG_FILE="${KUBECONFIG:-$HOME/.kube/config}"
+        
+        if [ ! -f "$KUBECONFIG_FILE" ]; then
+            echo "ERROR: Kubeconfig file not found: $KUBECONFIG_FILE"
+            exit 1
+        fi
+        
+        kubectl create secret generic kubeconfig \
+            --namespace "$NAMESPACE" \
+            --from-file=kubeconfig="$KUBECONFIG_FILE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+        
+        echo "✓ Kubeconfig secret created"
+    else
+        echo "Kubeconfig secret already exists"
+    fi
+    
+    echo ""
+    echo "✓ Setup complete"
+}
+
+cmd_create() {
+    local NODE_COUNT="${1:-10}"
+    
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating $NODE_COUNT Kubemark hollow nodes"
+    echo "Kubemark version: $KUBEMARK_VERSION"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "ERROR: Namespace $NAMESPACE does not exist"
+        echo "Please run: $0 setup"
+        exit 1
+    fi
+    
+    if ! kubectl get secret kubeconfig -n "$NAMESPACE" &>/dev/null; then
+        echo "ERROR: kubeconfig secret does not exist"
+        echo "Please run: $0 setup"
+        exit 1
+    fi
+    
+    cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hollow-nodes
+  namespace: $NAMESPACE
+spec:
+  replicas: $NODE_COUNT
+  selector:
+    matchLabels:
+      name: hollow-node
+  template:
+    metadata:
+      labels:
+        name: hollow-node
+    spec:
+      containers:
+      - name: hollow-kubelet
+        image: registry.k8s.io/kubemark:$KUBEMARK_VERSION
+        args:
+        - --morph=kubelet
+        - --name=\$(NODE_NAME)
+        - --kubeconfig=/kubeconfig/kubeconfig
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: kubeconfig
+          mountPath: /kubeconfig
+          readOnly: true
+        resources:
+          requests:
+            cpu: 20m
+            memory: 50Mi
+          limits:
+            cpu: 100m
+            memory: 100Mi
+      volumes:
+      - name: kubeconfig
+        secret:
+          secretName: kubeconfig
+EOF
+
+    echo ""
+    echo "✓ Hollow node deployment created with $NODE_COUNT replicas"
+    echo ""
+    echo "Waiting for nodes to register..."
+    sleep 5
+    
+    kubectl wait --for=condition=ready pod -l name=hollow-node -n "$NAMESPACE" --timeout=300s || true
+    
+    echo ""
+    echo "Hollow nodes status:"
+    kubectl get pods -n "$NAMESPACE" -l name=hollow-node
+}
+
+cmd_verify() {
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Verifying Kubemark hollow nodes"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Namespace $NAMESPACE does not exist"
+        exit 1
+    fi
+    
+    pod_count=$(kubectl get pods -n "$NAMESPACE" -l name=hollow-node --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    node_count=$(kubectl get nodes --no-headers 2>/dev/null | grep -i hollow | wc -l | tr -d ' ')
+    
+    echo ""
+    echo "Pods: $pod_count"
+    echo "Nodes: $node_count"
+    echo ""
+    
+    if [ "$pod_count" -gt 0 ]; then
+        echo "Pod status:"
+        kubectl get pods -n "$NAMESPACE" -l name=hollow-node
+    fi
+}
+
+cmd_cleanup() {
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Cleaning up Kubemark hollow nodes"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if kubectl get deployment hollow-nodes -n "$NAMESPACE" &>/dev/null; then
+        echo "Deleting hollow-nodes deployment..."
+        kubectl delete deployment hollow-nodes -n "$NAMESPACE"
+        echo "✓ Deployment deleted"
+    else
+        echo "No hollow-nodes deployment found"
+    fi
+}
+
+cmd_scale() {
+    local NODE_COUNT="${1:-}"
+    
+    check_kubectl
+    
+    if [ -z "$NODE_COUNT" ]; then
+        echo "ERROR: Usage: $0 scale <node-count>"
+        exit 1
+    fi
+    
+    echo "Scaling hollow nodes to $NODE_COUNT..."
+    kubectl scale deployment hollow-nodes -n "$NAMESPACE" --replicas="$NODE_COUNT"
+}
+
+cmd_list() {
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Kubemark Status"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if kubectl get deployment hollow-nodes -n "$NAMESPACE" &>/dev/null; then
+        kubectl get deployment hollow-nodes -n "$NAMESPACE"
+        echo ""
+        kubectl get pods -n "$NAMESPACE" -l name=hollow-node
+    else
+        echo "No hollow-nodes deployment found"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Kubemark Management
+
+Usage: $0 <command> [options]
+
+Commands:
+  setup                    Setup namespace and secrets (run once first)
+  
+  create [NODE_COUNT]      Create hollow nodes
+                          NODE_COUNT: Number of nodes (default: 10)
+                          
+  verify                   Verify hollow nodes status
+  
+  cleanup                  Cleanup hollow nodes
+  
+  scale NODE_COUNT         Scale hollow nodes
+                          NODE_COUNT: Target number of nodes
+                          
+  list                     List hollow nodes status
+  
+  help                     Show this help message
+
+EOF
+}
+
+COMMAND="${1:-help}"
+
+case "$COMMAND" in
+    setup) cmd_setup ;;
+    create) shift; cmd_create "$@" ;;
+    verify) cmd_verify ;;
+    cleanup) cmd_cleanup ;;
+    scale) shift; cmd_scale "$@" ;;
+    list) cmd_list ;;
+    help|--help|-h) cmd_help ;;
+    *) echo "ERROR: Unknown command: $COMMAND"; cmd_help; exit 1 ;;
+esac
+

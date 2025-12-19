@@ -1,0 +1,701 @@
+#!/bin/bash
+#
+# KWOK Cluster Management Script
+# Usage: ./kwok-cluster <command> [options]
+#
+# Commands:
+#   create [COUNT] [PREFIX]    - Create clusters (default: 10, prefix: kwok-cluster)
+#   verify [CLUSTER] [PREFIX]  - Verify clusters (all or specific)
+#   cleanup [PREFIX]           - Cleanup clusters
+#   scale CLUSTER COUNT        - Scale nodes in a cluster
+#   list                       - List all clusters
+#   help                       - Show this help message
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_PREFIX="kwok-cluster"
+
+# Check if kwokctl is installed
+check_kwokctl() {
+    if ! command -v kwokctl &> /dev/null; then
+        echo "ERROR: kwokctl is not installed"
+        echo ""
+        echo "Install with:"
+        echo "  macOS:   brew install kwok"
+        echo "  Linux:   See https://kwok.sigs.k8s.io/docs/user/install/"
+        echo "  Go:      go install sigs.k8s.io/kwok/cmd/kwokctl@latest"
+        exit 1
+    fi
+}
+
+# Check if kubectl is installed
+check_kubectl() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl is not installed"
+        exit 1
+    fi
+}
+
+# Create clusters
+cmd_create() {
+    local COUNT="${1:-10}"
+    local NAMESPACE_PREFIX="${2:-$DEFAULT_PREFIX}"
+    
+    check_kwokctl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating $COUNT KWOK clusters..."
+    echo "════════════════════════════════════════════════════════════════"
+    
+    start_time=$(date +%s)
+    created=0
+    failed=0
+    
+    for i in $(seq 1 $COUNT); do
+      cluster_name="${NAMESPACE_PREFIX}-$(printf "%04d" $i)"
+      
+      echo "[$i/$COUNT] Creating cluster: $cluster_name..."
+      
+      if kwokctl create cluster --name "$cluster_name" --wait 2m &>/dev/null; then
+        created=$((created + 1))
+        echo "  ✓ Created $cluster_name"
+      else
+        failed=$((failed + 1))
+        echo "  ✗ Failed to create $cluster_name"
+      fi
+      
+      # Batch to avoid overwhelming the system
+      if (( i % 5 == 0 )); then
+        echo "  Progress: $i/$COUNT clusters processed..."
+      fi
+    done
+    
+    end_time=$(date +%s)
+    total_time=$((end_time - start_time))
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Summary:"
+    echo "  Created: $created"
+    echo "  Failed:  $failed"
+    echo "  Time:    ${total_time}s"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # List all clusters
+    echo ""
+    echo "Listing all KWOK clusters:"
+    kwokctl get clusters
+}
+
+# Verify a single cluster
+verify_cluster() {
+    local cluster_name=$1
+    local context="kwok-$cluster_name"
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Cluster: $cluster_name"
+    echo "Context: $context"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Get kubeconfig from kwokctl directly (doesn't require context in default kubeconfig)
+    TEMP_KUBECONFIG=$(mktemp)
+    if ! kwokctl get kubeconfig --name "$cluster_name" > "$TEMP_KUBECONFIG" 2>/dev/null; then
+        echo "  Status: ✗ Cluster not found or kubeconfig unavailable"
+        echo ""
+        rm -f "$TEMP_KUBECONFIG"
+        return 1
+    fi
+    
+    # Use the temporary kubeconfig for all operations
+    KUBECTL_CMD="kubectl --kubeconfig $TEMP_KUBECONFIG"
+    
+    # Check cluster info (API server connectivity)
+    local cluster_info_output=""
+    if cluster_info_output=$($KUBECTL_CMD cluster-info 2>&1); then
+        local api_server=$(echo "$cluster_info_output" | grep "running at" | head -1 | sed 's/.*running at //' | sed 's/\s*$//')
+        echo "  API Server: $api_server"
+    else
+        echo "  API Server: ✗ Not accessible"
+    fi
+    
+    # Check health endpoint
+    local health_status="✗"
+    if $KUBECTL_CMD get --raw /healthz &>/dev/null; then
+        health_status="✓"
+    fi
+    echo "  Health Check: $health_status"
+    
+    # Check ready endpoint
+    local ready_status="✗"
+    if $KUBECTL_CMD get --raw /readyz &>/dev/null; then
+        ready_status="✓"
+    fi
+    echo "  Ready Check: $ready_status"
+    
+    # Get node count
+    local node_count=0
+    local node_output=""
+    if node_output=$($KUBECTL_CMD get nodes --no-headers 2>&1); then
+        if echo "$node_output" | grep -q "No resources found"; then
+            node_count=0
+        else
+            node_count=$(echo "$node_output" | grep -v "^$" | wc -l | tr -d ' ' || echo "0")
+        fi
+    fi
+    echo "  Node Count: $node_count"
+    
+    # Get node details if nodes exist
+    if [ "$node_count" -gt 0 ]; then
+        echo "  Nodes:"
+        $KUBECTL_CMD get nodes --no-headers 2>&1 | while read -r line; do
+            echo "    - $line"
+        done
+    fi
+    
+    # Cleanup temp file
+    rm -f "$TEMP_KUBECONFIG"
+    
+    # Overall status
+    if [ "$health_status" = "✓" ] && [ "$ready_status" = "✓" ]; then
+        echo "  Overall Status: ✓ Healthy"
+        echo ""
+        return 0
+    else
+        echo "  Overall Status: ✗ Unhealthy"
+        echo ""
+        return 1
+    fi
+}
+
+# Verify clusters
+cmd_verify() {
+    local SPECIFIC_CLUSTER="${1:-}"
+    local NAMESPACE_PREFIX="${2:-$DEFAULT_PREFIX}"
+    
+    check_kwokctl
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    if [ -n "$SPECIFIC_CLUSTER" ]; then
+        echo "Verifying cluster: $SPECIFIC_CLUSTER"
+    else
+        echo "Verifying all KWOK clusters with prefix: $NAMESPACE_PREFIX"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
+    
+    # Get list of clusters
+    if [ -n "$SPECIFIC_CLUSTER" ]; then
+        cluster_list="$SPECIFIC_CLUSTER"
+    else
+        cluster_list=$(kwokctl get clusters 2>/dev/null | grep "^$NAMESPACE_PREFIX" || echo "")
+        
+        if [ -z "$cluster_list" ]; then
+            echo "No clusters found with prefix: $NAMESPACE_PREFIX"
+            exit 0
+        fi
+    fi
+    
+    # Verify each cluster
+    total_clusters=0
+    healthy_count=0
+    unhealthy_count=0
+    total_nodes=0
+    
+    while IFS= read -r cluster; do
+        # Trim whitespace
+        cluster=$(echo "$cluster" | xargs)
+        
+        if [ -z "$cluster" ]; then
+            continue
+        fi
+        
+        total_clusters=$((total_clusters + 1))
+        
+        # Verify cluster and capture return value
+        if verify_cluster "$cluster"; then
+            healthy_count=$((healthy_count + 1))
+            
+            # Count nodes for this cluster using kwokctl
+            TEMP_KUBECONFIG=$(mktemp)
+            if kwokctl get kubeconfig --name "$cluster" > "$TEMP_KUBECONFIG" 2>/dev/null; then
+                node_output=$(kubectl --kubeconfig "$TEMP_KUBECONFIG" get nodes --no-headers 2>&1 || echo "")
+                if echo "$node_output" | grep -q "No resources found"; then
+                    node_count=0
+                else
+                    node_count=$(echo "$node_output" | grep -v "^$" | wc -l | tr -d ' ' || echo "0")
+                fi
+                if ! [[ "$node_count" =~ ^[0-9]+$ ]]; then
+                    node_count=0
+                fi
+                total_nodes=$((total_nodes + node_count))
+                rm -f "$TEMP_KUBECONFIG"
+            fi
+        else
+            unhealthy_count=$((unhealthy_count + 1))
+        fi
+    done <<< "$cluster_list"
+    
+    # Summary
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Summary:"
+    echo "  Total Clusters: $total_clusters"
+    echo "  Healthy: $healthy_count"
+    echo "  Unhealthy: $unhealthy_count"
+    echo "  Total Nodes: $total_nodes"
+    echo "════════════════════════════════════════════════════════════════"
+}
+
+# Cleanup clusters
+cmd_cleanup() {
+    local NAMESPACE_PREFIX="${1:-$DEFAULT_PREFIX}"
+    
+    check_kwokctl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Cleaning up KWOK clusters with prefix: $NAMESPACE_PREFIX"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # Get all clusters
+    clusters=$(kwokctl get clusters -o name 2>/dev/null | grep "$NAMESPACE_PREFIX" || true)
+    
+    if [ -z "$clusters" ]; then
+        echo "No clusters found with prefix: $NAMESPACE_PREFIX"
+        exit 0
+    fi
+    
+    cluster_count=$(echo "$clusters" | wc -l | tr -d ' ')
+    echo "Found $cluster_count clusters to delete"
+    echo ""
+    
+    deleted=0
+    failed=0
+    
+    for cluster in $clusters; do
+      cluster_name=$(echo "$cluster" | sed 's/cluster\.kwok\.x-k8s\.io\///')
+      echo "Deleting: $cluster_name..."
+      
+      if kwokctl delete cluster --name "$cluster_name" &>/dev/null; then
+        deleted=$((deleted + 1))
+        echo "  ✓ Deleted $cluster_name"
+      else
+        failed=$((failed + 1))
+        echo "  ✗ Failed to delete $cluster_name"
+      fi
+    done
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Summary:"
+    echo "  Deleted: $deleted"
+    echo "  Failed:  $failed"
+    echo "════════════════════════════════════════════════════════════════"
+}
+
+# Scale nodes in a cluster
+cmd_scale() {
+    local CLUSTER_NAME="${1:-}"
+    local NODE_COUNT="${2:-}"
+    
+    check_kwokctl
+    check_kubectl
+    
+    if [ -z "$CLUSTER_NAME" ] || [ -z "$NODE_COUNT" ]; then
+        echo "ERROR: Usage: $0 scale <cluster-name> <node-count>"
+        echo ""
+        echo "Example:"
+        echo "  $0 scale kwok-cluster-0001 10"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Scaling nodes in cluster: $CLUSTER_NAME"
+    echo "Target node count: $NODE_COUNT"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # Use kwokctl to scale nodes
+    if kwokctl scale node --name "$CLUSTER_NAME" --replicas "$NODE_COUNT" 2>/dev/null; then
+        echo "✓ Scaled to $NODE_COUNT nodes"
+        echo ""
+        echo "Verifying nodes..."
+        sleep 2
+        context="kwok-$CLUSTER_NAME"
+        kubectl --context "$context" get nodes
+    else
+        echo "✗ Failed to scale nodes"
+        echo ""
+        echo "Current node count:"
+        context="kwok-$CLUSTER_NAME"
+        kubectl --context "$context" get nodes
+        exit 1
+    fi
+}
+
+# List clusters
+cmd_list() {
+    check_kwokctl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "KWOK Clusters:"
+    echo "════════════════════════════════════════════════════════════════"
+    kwokctl get clusters
+    echo ""
+    echo "Contexts:"
+    kubectl config get-contexts | grep kwok || echo "  No KWOK contexts found"
+}
+
+# List pods in a cluster
+cmd_pods() {
+    local CLUSTER_NAME="${1:-}"
+    local NAMESPACE="${2:-}"
+    
+    check_kwokctl
+    check_kubectl
+    
+    if [ -z "$CLUSTER_NAME" ]; then
+        echo "ERROR: Usage: $0 pods <cluster-name> [namespace]"
+        echo ""
+        echo "Examples:"
+        echo "  $0 pods kwok-cluster-0001           # List pods in all namespaces"
+        echo "  $0 pods kwok-cluster-0001 kube-system  # List pods in specific namespace"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    if [ -n "$NAMESPACE" ]; then
+        echo "Listing pods in cluster: $CLUSTER_NAME (namespace: $NAMESPACE)"
+    else
+        echo "Listing pods in cluster: $CLUSTER_NAME (all namespaces)"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+    
+    run_kubectl_cmd "$CLUSTER_NAME" "pods" "$NAMESPACE"
+}
+
+# Helper function to get kubeconfig and run kubectl command
+run_kubectl_cmd() {
+    local CLUSTER_NAME=$1
+    local RESOURCE_TYPE=$2
+    local NAMESPACE="${3:-}"
+    
+    # Get kubeconfig from kwokctl
+    TEMP_KUBECONFIG=$(mktemp)
+    if ! kwokctl get kubeconfig --name "$CLUSTER_NAME" > "$TEMP_KUBECONFIG" 2>/dev/null; then
+        echo "ERROR: Cluster not found: $CLUSTER_NAME"
+        rm -f "$TEMP_KUBECONFIG"
+        return 1
+    fi
+    
+    # Run kubectl command
+    if [ -n "$NAMESPACE" ]; then
+        kubectl --kubeconfig "$TEMP_KUBECONFIG" get "$RESOURCE_TYPE" -n "$NAMESPACE"
+    else
+        kubectl --kubeconfig "$TEMP_KUBECONFIG" get "$RESOURCE_TYPE" --all-namespaces
+    fi
+    
+    rm -f "$TEMP_KUBECONFIG"
+}
+
+# List namespaces in a cluster
+cmd_ns() {
+    local CLUSTER_NAME="${1:-}"
+    
+    check_kwokctl
+    check_kubectl
+    
+    if [ -z "$CLUSTER_NAME" ]; then
+        echo "ERROR: Usage: $0 ns <cluster-name>"
+        echo ""
+        echo "Example:"
+        echo "  $0 ns kwok-cluster-0001"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Listing namespaces in cluster: $CLUSTER_NAME"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    run_kubectl_cmd "$CLUSTER_NAME" "namespaces"
+}
+
+# List deployments in a cluster
+cmd_deployment() {
+    local CLUSTER_NAME="${1:-}"
+    local NAMESPACE="${2:-}"
+    
+    check_kwokctl
+    check_kubectl
+    
+    if [ -z "$CLUSTER_NAME" ]; then
+        echo "ERROR: Usage: $0 deployment <cluster-name> [namespace]"
+        echo ""
+        echo "Examples:"
+        echo "  $0 deployment kwok-cluster-0001           # List deployments in all namespaces"
+        echo "  $0 deployment kwok-cluster-0001 default  # List deployments in specific namespace"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    if [ -n "$NAMESPACE" ]; then
+        echo "Listing deployments in cluster: $CLUSTER_NAME (namespace: $NAMESPACE)"
+    else
+        echo "Listing deployments in cluster: $CLUSTER_NAME (all namespaces)"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+    
+    run_kubectl_cmd "$CLUSTER_NAME" "deployments" "$NAMESPACE"
+}
+
+# List services in a cluster
+cmd_service() {
+    local CLUSTER_NAME="${1:-}"
+    local NAMESPACE="${2:-}"
+    
+    check_kwokctl
+    check_kubectl
+    
+    if [ -z "$CLUSTER_NAME" ]; then
+        echo "ERROR: Usage: $0 service <cluster-name> [namespace]"
+        echo ""
+        echo "Examples:"
+        echo "  $0 service kwok-cluster-0001           # List services in all namespaces"
+        echo "  $0 service kwok-cluster-0001 default   # List services in specific namespace"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    if [ -n "$NAMESPACE" ]; then
+        echo "Listing services in cluster: $CLUSTER_NAME (namespace: $NAMESPACE)"
+    else
+        echo "Listing services in cluster: $CLUSTER_NAME (all namespaces)"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+    
+    run_kubectl_cmd "$CLUSTER_NAME" "services" "$NAMESPACE"
+}
+
+# Export contexts to separate kubeconfig files
+cmd_export_contexts() {
+    local NAMESPACE_PREFIX="${1:-$DEFAULT_PREFIX}"
+    
+    check_kwokctl
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Exporting KWOK contexts to ~/.kube/configs/"
+    echo "Prefix: $NAMESPACE_PREFIX"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # Get all clusters
+    clusters=$(kwokctl get clusters 2>/dev/null | grep "^$NAMESPACE_PREFIX" || echo "")
+    
+    if [ -z "$clusters" ]; then
+        echo "No clusters found with prefix: $NAMESPACE_PREFIX"
+        exit 0
+    fi
+    
+    exported=0
+    failed=0
+    
+    # Create configs directory
+    CONFIGS_DIR="$HOME/.kube/configs"
+    mkdir -p "$CONFIGS_DIR"
+    
+    echo ""
+    echo "Exporting contexts to: $CONFIGS_DIR"
+    echo ""
+    
+    while IFS= read -r cluster; do
+        cluster=$(echo "$cluster" | xargs)
+        if [ -z "$cluster" ]; then
+            continue
+        fi
+        
+        echo "  Exporting context for: $cluster"
+        
+        # Export kubeconfig for this cluster to separate file
+        CONFIG_FILE="${CONFIGS_DIR}/${cluster}.yaml"
+        if kwokctl get kubeconfig --name "$cluster" > "$CONFIG_FILE" 2>/dev/null; then
+            exported=$((exported + 1))
+            echo "    ✓ Exported to ${CONFIG_FILE}"
+        else
+            failed=$((failed + 1))
+            echo "    ✗ Failed to export"
+        fi
+    done <<< "$clusters"
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Summary:"
+    echo "  Exported: $exported"
+    echo "  Failed:   $failed"
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
+    echo "Contexts are available in: $CONFIGS_DIR"
+    echo ""
+    echo "To use a context:"
+    echo "  export KUBECONFIG=~/.kube/configs/kwok-cluster-0001.yaml"
+    echo "  kubectl get nodes"
+    echo ""
+    echo "Or use --kubeconfig flag:"
+    echo "  kubectl --kubeconfig ~/.kube/configs/kwok-cluster-0001.yaml get nodes"
+    echo ""
+    echo "To list all exported configs:"
+    echo "  ls -1 ~/.kube/configs/"
+    echo ""
+    echo "To delete all KWOK configs:"
+    echo "  rm -rf ~/.kube/configs/*.yaml"
+}
+
+# Show help
+cmd_help() {
+    cat <<EOF
+KWOK Cluster Management
+
+Usage: $0 <command> [options]
+
+Commands:
+  create [COUNT] [PREFIX]    Create clusters
+                            COUNT: Number of clusters (default: 10)
+                            PREFIX: Cluster name prefix (default: kwok-cluster)
+                            
+                            Examples:
+                              $0 create              # Create 10 clusters
+                              $0 create 100         # Create 100 clusters
+                              $0 create 50 my-prefix # Create 50 with custom prefix
+
+  verify [CLUSTER] [PREFIX]  Verify clusters
+                            CLUSTER: Specific cluster name (optional)
+                            PREFIX: Filter by prefix (default: kwok-cluster)
+                            
+                            Examples:
+                              $0 verify                    # Verify all clusters
+                              $0 verify kwok-cluster-0001  # Verify specific cluster
+
+  cleanup [PREFIX]          Cleanup clusters
+                            PREFIX: Cluster name prefix (default: kwok-cluster)
+                            
+                            Examples:
+                              $0 cleanup              # Cleanup all default clusters
+                              $0 cleanup my-prefix    # Cleanup with custom prefix
+
+  scale CLUSTER COUNT       Scale nodes in a cluster
+                            CLUSTER: Cluster name
+                            COUNT: Number of nodes
+                            
+                            Examples:
+                              $0 scale kwok-cluster-0001 10
+
+  list                      List all clusters and contexts
+
+  pods CLUSTER [NAMESPACE]  List pods in a specific cluster
+                            CLUSTER: Cluster name (required)
+                            NAMESPACE: Optional namespace filter
+                            
+                            Examples:
+                              $0 pods kwok-cluster-0001              # All namespaces
+                              $0 pods kwok-cluster-0001 kube-system  # Specific namespace
+
+  ns CLUSTER                List namespaces in a specific cluster
+                            CLUSTER: Cluster name (required)
+                            
+                            Example:
+                              $0 ns kwok-cluster-0001
+
+  deployment CLUSTER [NS]   List deployments in a specific cluster
+                            CLUSTER: Cluster name (required)
+                            NS: Optional namespace filter
+                            
+                            Examples:
+                              $0 deployment kwok-cluster-0001        # All namespaces
+                              $0 deployment kwok-cluster-0001 default  # Specific namespace
+
+  service CLUSTER [NS]      List services in a specific cluster
+                            CLUSTER: Cluster name (required)
+                            NS: Optional namespace filter
+                            
+                            Examples:
+                              $0 service kwok-cluster-0001           # All namespaces
+                              $0 service kwok-cluster-0001 default   # Specific namespace
+
+  export-contexts [PREFIX]  Export all KWOK contexts to ~/.kube/configs/
+                            PREFIX: Cluster name prefix (default: kwok-cluster)
+                            
+                            Exports each cluster to a separate kubeconfig file
+                            in ~/.kube/configs/ (does not modify ~/.kube/config)
+                            Examples:
+                              $0 export-contexts              # Export all default clusters
+                              $0 export-contexts my-prefix    # Export with custom prefix
+
+  update-kubeconfig [PREFIX] Update default ~/.kube/config with KWOK contexts
+                            PREFIX: Cluster name prefix (default: kwok-cluster)
+                            
+                            Removes existing KWOK contexts and adds current ones
+                            Examples:
+                              $0 update-kubeconfig              # Update with all default clusters
+                              $0 update-kubeconfig my-prefix    # Update with custom prefix
+
+  help                      Show this help message
+
+EOF
+}
+
+# Main command dispatcher
+COMMAND="${1:-help}"
+
+case "$COMMAND" in
+    create)
+        shift
+        cmd_create "$@"
+        ;;
+    verify)
+        shift
+        cmd_verify "$@"
+        ;;
+    cleanup)
+        shift
+        cmd_cleanup "$@"
+        ;;
+    scale)
+        shift
+        cmd_scale "$@"
+        ;;
+    list)
+        cmd_list
+        ;;
+    pods)
+        shift
+        cmd_pods "$@"
+        ;;
+    ns)
+        shift
+        cmd_ns "$@"
+        ;;
+    deployment)
+        shift
+        cmd_deployment "$@"
+        ;;
+    service)
+        shift
+        cmd_service "$@"
+        ;;
+    export-contexts)
+        shift
+        cmd_export_contexts "$@"
+        ;;
+    update-kubeconfig)
+        shift
+        cmd_update_kubeconfig "$@"
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        echo "ERROR: Unknown command: $COMMAND"
+        echo ""
+        cmd_help
+        exit 1
+        ;;
+esac
+

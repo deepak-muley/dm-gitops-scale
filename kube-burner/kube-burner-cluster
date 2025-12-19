@@ -1,0 +1,209 @@
+#!/bin/bash
+#
+# kube-burner Cluster Management Script
+# Usage: ./kube-burner-cluster <command> [options]
+
+set -euo pipefail
+
+DEFAULT_NAMESPACE="dm-dev-workspace"
+DEFAULT_QPS=50
+DEFAULT_BURST=100
+
+check_kubectl() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl is not installed"
+        exit 1
+    fi
+}
+
+check_kubeburner() {
+    if ! command -v kube-burner &> /dev/null; then
+        echo "ERROR: kube-burner is not installed"
+        echo ""
+        echo "Install with:"
+        echo "  macOS:   brew install kube-burner"
+        echo "  Linux:   wget https://github.com/cloud-bulldozer/kube-burner/releases/latest/download/kube-burner-linux-x86_64.tar.gz"
+        echo "           tar -xzf kube-burner-linux-x86_64.tar.gz"
+        echo "           sudo mv kube-burner /usr/local/bin/"
+        exit 1
+    fi
+}
+
+cmd_create() {
+    local COUNT="${1:-10}"
+    local NAMESPACE="${2:-$DEFAULT_NAMESPACE}"
+    local QPS="${QPS:-$DEFAULT_QPS}"
+    local BURST="${BURST:-$DEFAULT_BURST}"
+    
+    check_kubectl
+    check_kubeburner
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating $COUNT CAPI clusters using kube-burner"
+    echo "Namespace: $NAMESPACE"
+    echo "QPS: $QPS, Burst: $BURST"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Creating namespace: $NAMESPACE"
+        kubectl create namespace "$NAMESPACE"
+    fi
+    
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    CONFIG_FILE=$(mktemp)
+    
+    cat > "$CONFIG_FILE" <<EOF
+global:
+  writeToFile: true
+  indexerConfig:
+    enabled: false
+
+jobs:
+- name: create-simulated-clusters
+  jobIterations: $COUNT
+  qps: $QPS
+  burst: $BURST
+  namespacedIterations: false
+  namespace: $NAMESPACE
+  objects:
+  - objectTemplate: templates/cluster.yaml
+    replicas: 1
+EOF
+
+    echo "Running kube-burner..."
+    start_time=$(date +%s)
+    
+    cd "$SCRIPT_DIR"
+    kube-burner init -c "$CONFIG_FILE"
+    
+    end_time=$(date +%s)
+    total_time=$((end_time - start_time))
+    
+    rm -f "$CONFIG_FILE"
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "✓ Created clusters in ${total_time} seconds"
+    echo "════════════════════════════════════════════════════════════════"
+}
+
+cmd_verify() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Verifying clusters in namespace: $NAMESPACE"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Namespace $NAMESPACE does not exist"
+        exit 1
+    fi
+    
+    total=$(kubectl get clusters -n "$NAMESPACE" -l simulation=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    echo ""
+    echo "Total clusters: $total"
+    
+    if [ "$total" -gt 0 ]; then
+        echo ""
+        echo "Sample clusters (first 10):"
+        kubectl get clusters -n "$NAMESPACE" -l simulation=true --no-headers | head -10
+    fi
+}
+
+cmd_cleanup() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Deleting all simulated clusters in namespace: $NAMESPACE"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Namespace $NAMESPACE does not exist. Nothing to cleanup."
+        exit 0
+    fi
+    
+    before_count=$(kubectl get clusters -n "$NAMESPACE" -l simulation=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    
+    if [ "$before_count" -eq 0 ]; then
+        echo "No simulated clusters found"
+        exit 0
+    fi
+    
+    echo "Found $before_count clusters to delete"
+    echo ""
+    
+    kubectl delete clusters -n "$NAMESPACE" -l simulation=true --wait=false
+    
+    echo "✓ Deletion initiated (running in background)"
+}
+
+cmd_list() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    
+    check_kubectl
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Clusters in namespace: $NAMESPACE"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Namespace $NAMESPACE does not exist"
+        exit 1
+    fi
+    
+    total=$(kubectl get clusters -n "$NAMESPACE" -l simulation=true --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    echo "Total clusters: $total"
+    echo ""
+    
+    if [ "$total" -gt 0 ]; then
+        kubectl get clusters -n "$NAMESPACE" -l simulation=true
+    else
+        echo "No clusters found"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+kube-burner Cluster Management
+
+Usage: $0 <command> [options]
+
+Commands:
+  create [COUNT] [NAMESPACE]    Create clusters using kube-burner
+                               COUNT: Number of clusters (default: 10)
+                               NAMESPACE: Kubernetes namespace (default: dm-dev-workspace)
+                               
+                               Examples:
+                                 $0 create
+                                 $0 create 100
+                                 QPS=100 BURST=200 $0 create 1000
+
+  verify [NAMESPACE]           Verify clusters
+                               NAMESPACE: Kubernetes namespace (default: dm-dev-workspace)
+
+  cleanup [NAMESPACE]          Cleanup clusters
+                               NAMESPACE: Kubernetes namespace (default: dm-dev-workspace)
+
+  list [NAMESPACE]             List all clusters
+                               NAMESPACE: Kubernetes namespace (default: dm-dev-workspace)
+
+  help                         Show this help message
+
+EOF
+}
+
+COMMAND="${1:-help}"
+
+case "$COMMAND" in
+    create) shift; cmd_create "$@" ;;
+    verify) shift; cmd_verify "$@" ;;
+    cleanup) shift; cmd_cleanup "$@" ;;
+    list) shift; cmd_list "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *) echo "ERROR: Unknown command: $COMMAND"; cmd_help; exit 1 ;;
+esac
+
