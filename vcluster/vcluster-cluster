@@ -6,6 +6,7 @@
 set -euo pipefail
 
 DEFAULT_PREFIX="vcluster"
+KIND_CLUSTER_NAME="vcluster-host"
 
 check_vcluster() {
     if ! command -v vcluster &> /dev/null; then
@@ -26,12 +27,71 @@ check_kubectl() {
     fi
 }
 
+check_kind() {
+    if ! command -v kind &> /dev/null; then
+        echo "ERROR: kind is not installed"
+        echo ""
+        echo "Install with:"
+        echo "  macOS:   brew install kind"
+        echo "  Linux:   curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64"
+        echo "           chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind"
+        exit 1
+    fi
+}
+
+# Ensure kind cluster exists and switch context to it
+ensure_kind_cluster() {
+    check_kind
+    check_kubectl
+    
+    # Check if kind cluster exists
+    if ! kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
+        echo "Creating kind cluster: $KIND_CLUSTER_NAME"
+        kind create cluster --name "$KIND_CLUSTER_NAME" --wait 5m
+        echo "✓ Kind cluster created"
+    else
+        echo "Kind cluster $KIND_CLUSTER_NAME already exists"
+    fi
+    
+    # Switch to the kind cluster context
+    kubectl config use-context "kind-${KIND_CLUSTER_NAME}" 2>/dev/null || {
+        echo "Warning: Could not switch to kind cluster context"
+        echo "Current contexts:"
+        kubectl config get-contexts
+        echo ""
+        echo "Trying to use kind cluster directly..."
+    }
+    
+    # Verify we can connect
+    if kubectl cluster-info &>/dev/null; then
+        echo "✓ Connected to kind cluster: $KIND_CLUSTER_NAME"
+    else
+        echo "Warning: Cannot connect to kind cluster. Please check:"
+        echo "  kubectl config get-contexts"
+        echo "  kubectl config use-context kind-${KIND_CLUSTER_NAME}"
+    fi
+}
+
+# Setup/bootstrap: Create kind cluster
+cmd_setup() {
+    ensure_kind_cluster
+    
+    echo ""
+    echo "✓ Setup complete"
+    echo ""
+    echo "Kind cluster '$KIND_CLUSTER_NAME' is ready for vclusters"
+    echo "You can now create vclusters with: $0 create"
+}
+
 cmd_create() {
     local COUNT="${1:-10}"
     local NAMESPACE_PREFIX="${2:-$DEFAULT_PREFIX}"
     
     check_vcluster
     check_kubectl
+    
+    # Ensure kind cluster exists
+    ensure_kind_cluster
     
     echo "════════════════════════════════════════════════════════════════"
     echo "Creating $COUNT virtual clusters..."
@@ -94,9 +154,15 @@ cmd_verify() {
 
 cmd_cleanup() {
     local NAMESPACE_PREFIX="${1:-$DEFAULT_PREFIX}"
+    local DELETE_KIND="${2:-false}"
     
     check_vcluster
     check_kubectl
+    
+    # Switch to the kind cluster if it exists
+    if kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
+        kubectl config use-context "kind-${KIND_CLUSTER_NAME}" 2>/dev/null || true
+    fi
     
     echo "════════════════════════════════════════════════════════════════"
     echo "Cleaning up virtual clusters with prefix: $NAMESPACE_PREFIX"
@@ -106,35 +172,79 @@ cmd_cleanup() {
     
     if [ -z "$vclusters" ]; then
         echo "No virtual clusters found"
-        exit 0
+    else
+        deleted=0
+        failed=0
+        
+        for vc in $vclusters; do
+          ns=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$vc\") | .Namespace" || echo "")
+          if [[ "$ns" == "${NAMESPACE_PREFIX}-"* ]]; then
+            echo "Deleting: $vc in namespace $ns..."
+            if vcluster delete "$vc" -n "$ns" &>/dev/null; then
+              deleted=$((deleted + 1))
+              echo "  ✓ Deleted $vc"
+            else
+              failed=$((failed + 1))
+              echo "  ✗ Failed to delete $vc"
+            fi
+          fi
+        done
+        
+        echo ""
+        echo "Summary:"
+        echo "  Deleted: $deleted"
+        echo "  Failed:  $failed"
     fi
     
-    deleted=0
-    failed=0
-    
-    for vc in $vclusters; do
-      ns=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$vc\") | .Namespace" || echo "")
-      if [[ "$ns" == "${NAMESPACE_PREFIX}-"* ]]; then
-        echo "Deleting: $vc in namespace $ns..."
-        if vcluster delete "$vc" -n "$ns" &>/dev/null; then
-          deleted=$((deleted + 1))
-          echo "  ✓ Deleted $vc"
+    # Optionally delete the kind cluster
+    if [ "$DELETE_KIND" = "true" ] || [ "$DELETE_KIND" = "yes" ]; then
+        echo ""
+        echo "Deleting kind cluster: $KIND_CLUSTER_NAME"
+        if kind delete cluster --name "$KIND_CLUSTER_NAME" 2>/dev/null; then
+            echo "✓ Kind cluster deleted"
         else
-          failed=$((failed + 1))
-          echo "  ✗ Failed to delete $vc"
+            echo "✗ Failed to delete kind cluster (may not exist)"
         fi
-      fi
-    done
-    
-    echo ""
-    echo "Summary:"
-    echo "  Deleted: $deleted"
-    echo "  Failed:  $failed"
+    fi
 }
 
 cmd_list() {
     check_vcluster
-    vcluster list
+    
+    # Switch to the kind cluster if it exists
+    if kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
+        kubectl config use-context "kind-${KIND_CLUSTER_NAME}" 2>/dev/null || true
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Virtual Clusters:"
+    echo "Host Cluster: $KIND_CLUSTER_NAME"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # Check if kubectl can connect first (this might be why it hangs)
+    if ! kubectl cluster-info &>/dev/null; then
+        echo "Warning: Cannot connect to Kubernetes cluster."
+        echo "vcluster list may hang if the API server is unreachable."
+        echo ""
+        echo "Run setup first: $0 setup"
+        echo ""
+        return 1
+    fi
+    
+    # Try JSON output first (usually faster and more reliable)
+    if command -v jq &>/dev/null; then
+        JSON_OUTPUT=$(vcluster list --output json 2>&1)
+        if [ $? -eq 0 ] && [ -n "$JSON_OUTPUT" ]; then
+            echo "$JSON_OUTPUT" | jq -r '
+                "NAME | NAMESPACE | STATUS | VERSION | AGE",
+                "-----+-----------+--------+---------+------",
+                (.[] | "\(.Name) | \(.Namespace) | \(.Status) | \(.Version) | \(.Age // "N/A")")'
+            return 0
+        fi
+    fi
+    
+    # Fallback to table output
+    vcluster list --output table 2>&1
 }
 
 # Helper function to get vcluster kubeconfig and run kubectl command
@@ -317,15 +427,20 @@ vcluster Management
 Usage: $0 <command> [options]
 
 Commands:
-  create [COUNT] [PREFIX]    Create virtual clusters
+  setup                     Create dedicated kind cluster for vclusters
+                            (Run this first before creating vclusters)
+
+  create [COUNT] [PREFIX]   Create virtual clusters
                             COUNT: Number of clusters (default: 10)
                             PREFIX: Namespace prefix (default: vcluster)
+                            Note: Automatically creates kind cluster if needed
 
   verify [PREFIX]           Verify/list clusters
                             PREFIX: Namespace prefix (default: vcluster)
 
-  cleanup [PREFIX]          Cleanup clusters
+  cleanup [PREFIX] [DELETE_KIND]  Cleanup clusters
                             PREFIX: Namespace prefix (default: vcluster)
+                            DELETE_KIND: Set to 'true' to also delete kind cluster
 
   list                      List all virtual clusters
 
@@ -367,6 +482,7 @@ EOF
 COMMAND="${1:-help}"
 
 case "$COMMAND" in
+    setup) cmd_setup ;;
     create) shift; cmd_create "$@" ;;
     verify) shift; cmd_verify "$@" ;;
     cleanup) shift; cmd_cleanup "$@" ;;
