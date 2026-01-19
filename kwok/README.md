@@ -22,6 +22,79 @@ chmod +x kwokctl
 sudo mv kwokctl /usr/local/bin/
 ```
 
+## How It Works
+
+KWOK (Kubernetes Without Kubelet) is a toolkit for simulating Kubernetes clusters and nodes without the overhead of running actual kubelets or container runtimes.
+
+### Simulation Architecture
+
+KWOK creates **simulated clusters** that appear to be fully functional Kubernetes clusters but use minimal resources:
+
+1. **API Server Simulation**: Each KWOK cluster runs a lightweight API server that responds to standard Kubernetes API calls, but without actual node infrastructure.
+
+2. **Node Simulation**: KWOK can simulate thousands of nodes within a cluster. These "nodes" are represented in the API but don't consume CPU, memory, or storage like real nodes.
+
+3. **Resource-Efficient**: Because there are no actual kubelets or containers, each simulated node consumes only ~36KB of memory.
+
+### What Gets Created
+
+When you create a KWOK cluster:
+
+```bash
+kwokctl create cluster --name kwok-cluster-0001
+```
+
+KWOK sets up:
+- **API Server**: A lightweight Kubernetes API server that handles API requests
+- **etcd**: A minimal etcd instance for cluster state storage
+- **Node Objects**: Virtual node objects that appear in `kubectl get nodes` but don't run workloads
+- **Network**: A simulated network stack
+
+**No actual compute resources** are created - no VMs, no containers, no kubelets.
+
+### How Node Simulation Works
+
+When you scale nodes in a KWOK cluster:
+
+```bash
+kwokctl scale node --replicas=100 --name kwok-cluster-0001
+```
+
+KWOK creates **virtual node objects** that:
+- Register with the API server as normal Kubernetes nodes
+- Report status (Ready, memory, CPU) but with simulated values
+- Can be scheduled against (schedulers see them as real nodes)
+- **Don't run actual pods** - pods appear in the API but don't consume resources
+
+### What You Can Test
+
+KWOK clusters are ideal for testing:
+
+1. **Scheduling Logic**: Test how schedulers behave with many nodes, different node types, and resource constraints.
+
+2. **API Server Performance**: Stress test API servers with thousands of nodes and objects without compute overhead.
+
+3. **Cluster Management Tools**: Test cluster lifecycle management, monitoring, and automation tools that work with Kubernetes APIs.
+
+4. **Multi-Cluster Scenarios**: Simulate many clusters (1000+) to test multi-cluster management tools.
+
+### Limitations
+
+KWOK clusters are **simulations** and have limitations:
+
+- **No Actual Workload Execution**: Pods can be created via API, but containers don't actually run.
+- **Simulated Resources**: CPU, memory, and storage are simulated - not real resources.
+- **API-Only**: If your tool requires actual container execution or networking, KWOK won't work.
+
+### Differences from Other Methods
+
+| Method | What It Creates | Resource Usage | Workload Execution |
+|--------|----------------|----------------|-------------------|
+| **KWOK** | Simulated cluster + nodes | ~36KB/node | ❌ No (simulated only) |
+| **vcluster** | Virtual cluster with real API | ~128MB/cluster | ✅ Yes (runs in host) |
+| **Paused CAPI** | API objects only | ~1KB/object | ❌ No (paused) |
+| **Kubemark** | Hollow nodes | ~50MB/node | ❌ No (hollow) |
+
 ## Usage
 
 ### Unified Command (Recommended)

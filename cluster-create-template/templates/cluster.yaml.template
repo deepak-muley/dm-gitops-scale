@@ -1,0 +1,45 @@
+# ============================================================================
+# TEMPLATE MANIFEST - Customize for your method
+# ============================================================================
+#
+# This is a sample template file. If your method uses templates for creating
+# Kubernetes resources, customize this file.
+#
+# Common template variables (depends on your tool):
+# - {{.Iteration}} or ${ITERATION} - Current iteration number
+# - {{.Namespace}} or ${NAMESPACE} - Target namespace
+# - {{.Name}} or ${NAME} - Cluster name
+# - {{.Index}} or ${INDEX} - Zero-based index
+#
+# Delete this file if your method doesn't use templates.
+# ============================================================================
+
+# Example: CAPI-style cluster template
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: sim-cluster-{{.Iteration}}
+  namespace: {{.Namespace}}
+  annotations:
+    cluster.x-k8s.io/paused: "true"
+    simulation: "true"
+    created-by: "[template]"
+  labels:
+    simulation: "true"
+    iteration: "{{.Iteration}}"
+    batch: "scale-test"
+spec:
+  paused: true
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - 192.168.0.0/16
+    services:
+      cidrBlocks:
+        - 10.96.0.0/12
+    serviceDomain: cluster.local
+
+# Add additional resources as needed for your method
+# ---
+# apiVersion: ...
+# kind: ...

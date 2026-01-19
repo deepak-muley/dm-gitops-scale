@@ -1,0 +1,377 @@
+#!/bin/bash
+#
+# [TEMPLATE_NAME] Cluster Management Script
+# Usage: ./template-cluster <command> [options]
+#
+# ============================================================================
+# HOW TO ADAPT THIS TEMPLATE:
+# 1. Copy this folder: cp -r cluster-create-template your-method-name
+# 2. Rename this file: mv your-method-name/template-cluster your-method-name/your-method-name-cluster
+# 3. Search and replace all placeholders (marked with [PLACEHOLDER]):
+#    - [TEMPLATE_NAME] -> Your method name (e.g., "Nutanix NKP", "Rancher")
+#    - [template] -> lowercase method name (e.g., "nkp", "rancher")
+#    - [TEMPLATE_TOOL] -> main CLI tool name (e.g., "nkp", "rancher")
+# 4. Implement the required functions (marked with TODO)
+# 5. Update the README.md with your method's documentation
+# 6. Add templates/ folder if needed for manifests
+# ============================================================================
+
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURATION - Customize these for your method
+# ============================================================================
+
+# Default values - adjust for your method
+DEFAULT_NAMESPACE="dm-dev-workspace"     # Default namespace for resources
+DEFAULT_PREFIX="[template]-cluster"       # Default cluster name prefix
+DEFAULT_COUNT=10                          # Default number of clusters to create
+
+# Management cluster kubeconfig
+# Set via environment variable or pass as argument
+MGMT_KUBECONFIG="${MGMT_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}"
+
+# Tool-specific configuration
+# Add any method-specific configuration variables here
+# Example: TOOL_VERSION="${TOOL_VERSION:-v1.0.0}"
+
+# ============================================================================
+# HELPER FUNCTIONS - Common utilities
+# ============================================================================
+
+# Check if kubectl is installed (required for most methods)
+check_kubectl() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl is not installed"
+        echo ""
+        echo "Install with:"
+        echo "  macOS:   brew install kubectl"
+        echo "  Linux:   curl -LO https://dl.k8s.io/release/\$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        echo "           chmod +x kubectl && sudo mv kubectl /usr/local/bin/"
+        exit 1
+    fi
+}
+
+# Check if the main tool for this method is installed
+# TODO: Replace [TEMPLATE_TOOL] with your actual tool name
+check_[template]_tool() {
+    if ! command -v [TEMPLATE_TOOL] &> /dev/null; then
+        echo "ERROR: [TEMPLATE_TOOL] is not installed"
+        echo ""
+        echo "Install with:"
+        echo "  macOS:   [INSTALL_COMMAND_MACOS]"
+        echo "  Linux:   [INSTALL_COMMAND_LINUX]"
+        echo ""
+        echo "Documentation: [TOOL_DOCUMENTATION_URL]"
+        exit 1
+    fi
+}
+
+# Verify management cluster connectivity
+check_mgmt_cluster() {
+    local kubeconfig="${1:-$MGMT_KUBECONFIG}"
+    
+    echo "Checking management cluster connectivity..."
+    echo "Kubeconfig: $kubeconfig"
+    
+    if [ ! -f "$kubeconfig" ]; then
+        echo "ERROR: Kubeconfig file not found: $kubeconfig"
+        echo ""
+        echo "Please provide a valid kubeconfig:"
+        echo "  export MGMT_KUBECONFIG=/path/to/kubeconfig"
+        echo "  or pass as argument"
+        exit 1
+    fi
+    
+    if ! kubectl --kubeconfig "$kubeconfig" cluster-info &>/dev/null; then
+        echo "ERROR: Cannot connect to management cluster"
+        echo ""
+        echo "Please verify:"
+        echo "  1. The kubeconfig is valid: $kubeconfig"
+        echo "  2. The cluster is accessible"
+        echo "  3. Your credentials are current"
+        exit 1
+    fi
+    
+    echo "✓ Connected to management cluster"
+}
+
+# Get script directory for templates
+get_script_dir() {
+    cd "$(dirname "${BASH_SOURCE[0]}")" && pwd
+}
+
+# ============================================================================
+# COMMAND IMPLEMENTATIONS - Implement these for your method
+# ============================================================================
+
+# Setup/bootstrap: Verify prerequisites and connectivity
+cmd_setup() {
+    echo "════════════════════════════════════════════════════════════════"
+    echo "[TEMPLATE_NAME] Setup"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    check_kubectl
+    # check_[template]_tool  # Uncomment and rename
+    
+    echo ""
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+    
+    echo ""
+    echo "✓ Setup complete"
+    echo ""
+    echo "Environment:"
+    echo "  Kubeconfig: $MGMT_KUBECONFIG"
+    echo ""
+    echo "You can now create clusters with: $0 create"
+}
+
+# Create clusters
+cmd_create() {
+    local COUNT="${1:-$DEFAULT_COUNT}"
+    local NAMESPACE="${2:-$DEFAULT_NAMESPACE}"
+    local KUBECONFIG_ARG="${3:-$MGMT_KUBECONFIG}"
+    
+    check_kubectl
+    # check_[template]_tool  # Uncomment and rename
+    check_mgmt_cluster "$KUBECONFIG_ARG"
+    
+    SCRIPT_DIR="$(get_script_dir)"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating $COUNT [TEMPLATE_NAME] clusters"
+    echo "Namespace:  $NAMESPACE"
+    echo "Kubeconfig: $KUBECONFIG_ARG"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # Ensure namespace exists
+    if ! kubectl --kubeconfig "$KUBECONFIG_ARG" get namespace "$NAMESPACE" &>/dev/null; then
+        echo "Creating namespace: $NAMESPACE"
+        kubectl --kubeconfig "$KUBECONFIG_ARG" create namespace "$NAMESPACE"
+    fi
+    
+    start_time=$(date +%s)
+    created=0
+    failed=0
+    
+    # TODO: Implement cluster creation logic
+    for i in $(seq 1 $COUNT); do
+        cluster_name="sim-cluster-$(printf "%04d" $i)"
+        
+        echo "[$i/$COUNT] Creating cluster: $cluster_name..."
+        
+        # Option 1: Use CLI with --dry-run to generate manifest, then apply
+        # MANIFEST_FILE=$(mktemp)
+        # if your_tool create cluster "$cluster_name" --dry-run --output yaml > "$MANIFEST_FILE"; then
+        #     if kubectl --kubeconfig "$KUBECONFIG_ARG" apply -f "$MANIFEST_FILE" 2>/dev/null; then
+        #         created=$((created + 1))
+        #         echo "  ✓ Created $cluster_name"
+        #     fi
+        # fi
+        # rm -f "$MANIFEST_FILE"
+        
+        # Option 2: Generate manifest from template and apply
+        # cat "$SCRIPT_DIR/templates/cluster.yaml" | \
+        #     sed "s/{{.Name}}/$cluster_name/g" | \
+        #     sed "s/{{.Namespace}}/$NAMESPACE/g" | \
+        #     kubectl --kubeconfig "$KUBECONFIG_ARG" apply -f -
+        
+        # Placeholder - remove after implementing
+        echo "  TODO: Implement cluster creation for $cluster_name"
+        created=$((created + 1))
+        
+        if (( i % 10 == 0 )); then
+            echo "  Progress: $i/$COUNT clusters processed..."
+        fi
+    done
+    
+    end_time=$(date +%s)
+    total_time=$((end_time - start_time))
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Summary:"
+    echo "  Created: $created"
+    echo "  Failed:  $failed"
+    echo "  Time:    ${total_time}s"
+    echo "════════════════════════════════════════════════════════════════"
+}
+
+# Verify clusters
+cmd_verify() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    local KUBECONFIG_ARG="${2:-$MGMT_KUBECONFIG}"
+    
+    check_kubectl
+    check_mgmt_cluster "$KUBECONFIG_ARG"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Verifying [TEMPLATE_NAME] clusters"
+    echo "Namespace:  $NAMESPACE"
+    echo "Kubeconfig: $KUBECONFIG_ARG"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # TODO: Implement verification logic
+    # Example:
+    # total=$(kubectl --kubeconfig "$KUBECONFIG_ARG" get clusters -n "$NAMESPACE" -l your-label --no-headers | wc -l)
+    # echo "Total clusters: $total"
+    
+    echo ""
+    echo "TODO: Implement verification logic"
+}
+
+# Cleanup clusters
+cmd_cleanup() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    local KUBECONFIG_ARG="${2:-$MGMT_KUBECONFIG}"
+    
+    check_kubectl
+    check_mgmt_cluster "$KUBECONFIG_ARG"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Cleaning up [TEMPLATE_NAME] clusters"
+    echo "Namespace:  $NAMESPACE"
+    echo "Kubeconfig: $KUBECONFIG_ARG"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # TODO: Implement cleanup logic
+    # Example:
+    # kubectl --kubeconfig "$KUBECONFIG_ARG" delete clusters -n "$NAMESPACE" -l your-label --wait=false
+    
+    echo ""
+    echo "TODO: Implement cleanup logic"
+}
+
+# List clusters
+cmd_list() {
+    local NAMESPACE="${1:-$DEFAULT_NAMESPACE}"
+    local KUBECONFIG_ARG="${2:-$MGMT_KUBECONFIG}"
+    
+    check_kubectl
+    check_mgmt_cluster "$KUBECONFIG_ARG"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "[TEMPLATE_NAME] Clusters"
+    echo "Namespace:  $NAMESPACE"
+    echo "Kubeconfig: $KUBECONFIG_ARG"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # TODO: Implement list logic
+    # Example:
+    # kubectl --kubeconfig "$KUBECONFIG_ARG" get clusters -n "$NAMESPACE" -l your-label
+    
+    echo ""
+    echo "TODO: Implement list logic"
+}
+
+# Optional: Export a single cluster manifest
+cmd_export() {
+    local CLUSTER_NAME="${1:-}"
+    local OUTPUT_FILE="${2:-}"
+    
+    if [ -z "$CLUSTER_NAME" ]; then
+        echo "ERROR: Usage: $0 export <cluster-name> [output-file]"
+        exit 1
+    fi
+    
+    OUTPUT_FILE="${OUTPUT_FILE:-${CLUSTER_NAME}.yaml}"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Exporting [TEMPLATE_NAME] cluster manifest"
+    echo "Cluster: $CLUSTER_NAME"
+    echo "Output:  $OUTPUT_FILE"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    # TODO: Implement export logic using your CLI's --dry-run
+    # Example:
+    # your_tool create cluster "$CLUSTER_NAME" --dry-run --output yaml > "$OUTPUT_FILE"
+    
+    echo ""
+    echo "TODO: Implement export logic"
+}
+
+# Show help
+cmd_help() {
+    cat <<EOF
+[TEMPLATE_NAME] Cluster Management
+
+Usage: $0 <command> [options]
+
+Commands:
+  setup                         Verify prerequisites and connectivity
+
+  create [COUNT] [NAMESPACE] [KUBECONFIG]
+                                Create clusters
+                                COUNT:      Number of clusters (default: $DEFAULT_COUNT)
+                                NAMESPACE:  Target namespace (default: $DEFAULT_NAMESPACE)
+                                KUBECONFIG: Path to management cluster kubeconfig
+                                
+                                Examples:
+                                  $0 create
+                                  $0 create 100
+                                  $0 create 50 my-namespace
+                                  $0 create 50 my-namespace /path/to/kubeconfig
+
+  verify [NAMESPACE] [KUBECONFIG]
+                                Verify clusters
+
+  cleanup [NAMESPACE] [KUBECONFIG]
+                                Delete clusters
+
+  list [NAMESPACE] [KUBECONFIG]
+                                List all clusters
+
+  export <CLUSTER_NAME> [OUTPUT_FILE]
+                                Export cluster manifest using CLI --dry-run
+
+  help                          Show this help message
+
+Environment Variables:
+  MGMT_KUBECONFIG   Path to management cluster kubeconfig
+                    (default: \$KUBECONFIG or ~/.kube/config)
+  
+  # Add your method-specific environment variables here
+
+EOF
+}
+
+# ============================================================================
+# MAIN COMMAND DISPATCHER
+# ============================================================================
+
+COMMAND="${1:-help}"
+
+case "$COMMAND" in
+    setup)
+        cmd_setup
+        ;;
+    create)
+        shift
+        cmd_create "$@"
+        ;;
+    verify)
+        shift
+        cmd_verify "$@"
+        ;;
+    cleanup)
+        shift
+        cmd_cleanup "$@"
+        ;;
+    list)
+        shift
+        cmd_list "$@"
+        ;;
+    export)
+        shift
+        cmd_export "$@"
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        echo "ERROR: Unknown command: $COMMAND"
+        echo ""
+        cmd_help
+        exit 1
+        ;;
+esac

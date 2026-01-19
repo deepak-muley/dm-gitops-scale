@@ -1,0 +1,12 @@
+# Ignore generated cluster manifests (they should be in their own GitOps repo)
+clusters/
+
+# Ignore actual config file (contains sensitive info)
+nkp.config
+
+# Ignore actual CSV files with real cluster data
+clusters.csv
+
+# Keep example files
+!nkp.config.example
+!clusters.csv.example

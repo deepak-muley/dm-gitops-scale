@@ -1,0 +1,68 @@
+# Nutanix NKP Configuration
+# Copy this file to nkp.config and update with your values
+#
+# Usage: 
+#   cp nkp.config.example nkp.config
+#   # Edit nkp.config with your values
+#   ./nkp-cluster create --csv-file clusters.csv
+
+# ============================================================================
+# Management Cluster
+# ============================================================================
+# Path to your NKP management cluster kubeconfig
+MGMT_KUBECONFIG="$HOME/.kube/nkp-mgmt-kubeconfig"
+
+# ============================================================================
+# Nutanix Infrastructure
+# ============================================================================
+# Prism Central endpoint (without https:// prefix)
+NUTANIX_ENDPOINT="prism-central.example.com"
+NUTANIX_PORT="9440"
+
+# Prism Element cluster name
+NUTANIX_PRISM_ELEMENT_CLUSTER="pe-cluster-1"
+
+# Network subnet name
+NUTANIX_SUBNET="vm-network"
+
+# Storage container for CSI
+NUTANIX_STORAGE_CONTAINER="default-container"
+
+# VM image name (must exist in Prism)
+NUTANIX_VM_IMAGE="nkp-ubuntu-22.04-1.28.0"
+
+# SSH public key file for node access
+NUTANIX_SSH_KEY_FILE="$HOME/.ssh/id_rsa.pub"
+
+# ============================================================================
+# Kubernetes Configuration
+# ============================================================================
+# Kubernetes version
+KUBERNETES_VERSION="v1.28.0"
+
+# Default replicas (can be overridden per-cluster in CSV)
+CONTROL_PLANE_REPLICAS="3"
+WORKER_REPLICAS="3"
+WORKER_VCPUS="4"
+
+# ============================================================================
+# Container Registry (for air-gapped environments)
+# ============================================================================
+# Leave empty to use default registries
+REGISTRY_URL=""
+REGISTRY_USERNAME=""
+REGISTRY_PASSWORD=""
+
+# Or configure for private registry:
+# REGISTRY_URL="registry.example.com"
+# REGISTRY_USERNAME="admin"
+# REGISTRY_PASSWORD="secret"
+
+# ============================================================================
+# Output Configuration
+# ============================================================================
+# Directory for storing generated manifests (GitOps)
+CLUSTERS_DIR="$SCRIPT_DIR/clusters"
+
+# Default namespace for clusters
+DEFAULT_NAMESPACE="dm-dev-workspace"

@@ -1,0 +1,916 @@
+#!/bin/bash
+#
+# Nutanix NKP Cluster Management Script
+# Usage: ./nkp-cluster <command> [options]
+#
+# Creates NKP clusters using the NKP CLI with --dry-run to generate manifests,
+# stores them for GitOps, and optionally applies them to the management cluster.
+#
+# Supports:
+# - Named parameters for all NKP CLI options
+# - CSV file input for batch cluster creation
+# - GitOps-friendly YAML storage structure
+
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURATION - Default values (can be overridden via env vars or arguments)
+# ============================================================================
+
+# Management cluster
+MGMT_KUBECONFIG="${MGMT_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}"
+
+# Default namespace
+DEFAULT_NAMESPACE="${DEFAULT_NAMESPACE:-dm-dev-workspace}"
+
+# Nutanix environment defaults (set via env vars or config file)
+NUTANIX_ENDPOINT="${NUTANIX_ENDPOINT:-}"
+NUTANIX_PORT="${NUTANIX_PORT:-9440}"
+NUTANIX_PRISM_ELEMENT_CLUSTER="${NUTANIX_PRISM_ELEMENT_CLUSTER:-}"
+NUTANIX_SUBNET="${NUTANIX_SUBNET:-}"
+NUTANIX_STORAGE_CONTAINER="${NUTANIX_STORAGE_CONTAINER:-}"
+NUTANIX_VM_IMAGE="${NUTANIX_VM_IMAGE:-}"
+NUTANIX_SSH_KEY_FILE="${NUTANIX_SSH_KEY_FILE:-}"
+
+# Kubernetes defaults
+KUBERNETES_VERSION="${KUBERNETES_VERSION:-v1.28.0}"
+CONTROL_PLANE_REPLICAS="${CONTROL_PLANE_REPLICAS:-3}"
+WORKER_REPLICAS="${WORKER_REPLICAS:-3}"
+WORKER_VCPUS="${WORKER_VCPUS:-4}"
+
+# Registry defaults
+REGISTRY_URL="${REGISTRY_URL:-}"
+REGISTRY_USERNAME="${REGISTRY_USERNAME:-}"
+REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-}"
+
+# Script directory and output paths
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLUSTERS_DIR="${CLUSTERS_DIR:-$SCRIPT_DIR/clusters}"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+check_kubectl() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl is not installed"
+        exit 1
+    fi
+}
+
+check_nkp() {
+    if ! command -v nkp &> /dev/null; then
+        echo "ERROR: nkp CLI is not installed"
+        echo ""
+        echo "Install from Nutanix Portal: https://portal.nutanix.com/"
+        exit 1
+    fi
+}
+
+check_mgmt_cluster() {
+    local kubeconfig="${1:-$MGMT_KUBECONFIG}"
+    
+    if [ ! -f "$kubeconfig" ]; then
+        echo "ERROR: Kubeconfig file not found: $kubeconfig"
+        exit 1
+    fi
+    
+    if ! kubectl --kubeconfig "$kubeconfig" cluster-info &>/dev/null; then
+        echo "ERROR: Cannot connect to management cluster"
+        exit 1
+    fi
+    
+    echo "✓ Connected to management cluster"
+}
+
+# Load configuration from file if exists
+load_config() {
+    local config_file="${1:-$SCRIPT_DIR/nkp.config}"
+    
+    if [ -f "$config_file" ]; then
+        echo "Loading configuration from: $config_file"
+        # shellcheck source=/dev/null
+        source "$config_file"
+    fi
+}
+
+# Parse named arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --cluster-name|-c)
+                CLUSTER_NAME="$2"
+                shift 2
+                ;;
+            --namespace|-n)
+                NAMESPACE="$2"
+                shift 2
+                ;;
+            --control-plane-replicas)
+                CONTROL_PLANE_REPLICAS="$2"
+                shift 2
+                ;;
+            --worker-replicas)
+                WORKER_REPLICAS="$2"
+                shift 2
+                ;;
+            --control-plane-endpoint-ip)
+                CONTROL_PLANE_ENDPOINT_IP="$2"
+                shift 2
+                ;;
+            --service-lb-ip-range)
+                SERVICE_LB_IP_RANGE="$2"
+                shift 2
+                ;;
+            --endpoint)
+                NUTANIX_ENDPOINT="$2"
+                shift 2
+                ;;
+            --port)
+                NUTANIX_PORT="$2"
+                shift 2
+                ;;
+            --prism-element-cluster)
+                NUTANIX_PRISM_ELEMENT_CLUSTER="$2"
+                shift 2
+                ;;
+            --subnet)
+                NUTANIX_SUBNET="$2"
+                shift 2
+                ;;
+            --storage-container)
+                NUTANIX_STORAGE_CONTAINER="$2"
+                shift 2
+                ;;
+            --vm-image)
+                NUTANIX_VM_IMAGE="$2"
+                shift 2
+                ;;
+            --ssh-public-key-file)
+                NUTANIX_SSH_KEY_FILE="$2"
+                shift 2
+                ;;
+            --kubernetes-version)
+                KUBERNETES_VERSION="$2"
+                shift 2
+                ;;
+            --worker-vcpus)
+                WORKER_VCPUS="$2"
+                shift 2
+                ;;
+            --registry-url)
+                REGISTRY_URL="$2"
+                shift 2
+                ;;
+            --registry-username)
+                REGISTRY_USERNAME="$2"
+                shift 2
+                ;;
+            --registry-password)
+                REGISTRY_PASSWORD="$2"
+                shift 2
+                ;;
+            --kubeconfig)
+                MGMT_KUBECONFIG="$2"
+                shift 2
+                ;;
+            --csv-file)
+                CSV_FILE="$2"
+                shift 2
+                ;;
+            --config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            --apply)
+                APPLY_MANIFESTS="true"
+                shift
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                # Unknown option or positional argument
+                POSITIONAL_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# CLUSTER MANIFEST GENERATION
+# ============================================================================
+
+# Generate cluster manifest using NKP CLI --dry-run
+generate_cluster_manifest() {
+    local cluster_name=$1
+    local namespace=$2
+    local control_plane_ip=$3
+    local service_lb_range=$4
+    local output_file=$5
+    
+    local cp_replicas="${CONTROL_PLANE_REPLICAS:-3}"
+    local worker_replicas="${WORKER_REPLICAS:-3}"
+    
+    echo "  Generating manifest for: $cluster_name"
+    
+    # Build the NKP CLI command
+    local nkp_cmd="nkp create cluster nutanix"
+    nkp_cmd+=" -c ${cluster_name}"
+    nkp_cmd+=" --namespace ${namespace}"
+    nkp_cmd+=" --control-plane-replicas ${cp_replicas}"
+    nkp_cmd+=" --worker-replicas ${worker_replicas}"
+    
+    # Nutanix endpoint
+    if [ -n "${NUTANIX_ENDPOINT:-}" ]; then
+        nkp_cmd+=" --endpoint https://${NUTANIX_ENDPOINT}:${NUTANIX_PORT}"
+    fi
+    
+    # Control plane settings
+    nkp_cmd+=" --control-plane-endpoint-ip ${control_plane_ip}"
+    
+    if [ -n "${NUTANIX_VM_IMAGE:-}" ]; then
+        nkp_cmd+=" --control-plane-vm-image ${NUTANIX_VM_IMAGE}"
+        nkp_cmd+=" --worker-vm-image ${NUTANIX_VM_IMAGE}"
+    fi
+    
+    if [ -n "${NUTANIX_PRISM_ELEMENT_CLUSTER:-}" ]; then
+        nkp_cmd+=" --control-plane-prism-element-cluster ${NUTANIX_PRISM_ELEMENT_CLUSTER}"
+        nkp_cmd+=" --worker-prism-element-cluster ${NUTANIX_PRISM_ELEMENT_CLUSTER}"
+    fi
+    
+    if [ -n "${NUTANIX_SUBNET:-}" ]; then
+        nkp_cmd+=" --control-plane-subnets ${NUTANIX_SUBNET}"
+        nkp_cmd+=" --worker-subnets ${NUTANIX_SUBNET}"
+    fi
+    
+    # Worker settings
+    if [ -n "${WORKER_VCPUS:-}" ]; then
+        nkp_cmd+=" --worker-vcpus ${WORKER_VCPUS}"
+    fi
+    
+    # Storage
+    if [ -n "${NUTANIX_STORAGE_CONTAINER:-}" ]; then
+        nkp_cmd+=" --csi-storage-container ${NUTANIX_STORAGE_CONTAINER}"
+    fi
+    
+    # Registry
+    if [ -n "${REGISTRY_URL:-}" ]; then
+        nkp_cmd+=" --registry-url ${REGISTRY_URL}"
+    fi
+    if [ -n "${REGISTRY_USERNAME:-}" ]; then
+        nkp_cmd+=" --registry-username ${REGISTRY_USERNAME}"
+    fi
+    if [ -n "${REGISTRY_PASSWORD:-}" ]; then
+        nkp_cmd+=" --registry-password ${REGISTRY_PASSWORD}"
+    fi
+    
+    # Kubernetes version
+    if [ -n "${KUBERNETES_VERSION:-}" ]; then
+        nkp_cmd+=" --kubernetes-version ${KUBERNETES_VERSION}"
+    fi
+    
+    # Service LB IP range
+    if [ -n "${service_lb_range:-}" ]; then
+        nkp_cmd+=" --kubernetes-service-load-balancer-ip-range ${service_lb_range}"
+    fi
+    
+    # SSH key
+    if [ -n "${NUTANIX_SSH_KEY_FILE:-}" ]; then
+        nkp_cmd+=" --ssh-public-key-file ${NUTANIX_SSH_KEY_FILE}"
+    fi
+    
+    # Management cluster kubeconfig
+    nkp_cmd+=" --kubeconfig ${MGMT_KUBECONFIG}"
+    
+    # Dry-run and output
+    nkp_cmd+=" --dry-run -o yaml"
+    
+    # Execute and capture output
+    if eval "$nkp_cmd" > "$output_file" 2>/dev/null; then
+        return 0
+    else
+        echo "  WARNING: NKP CLI failed, check configuration"
+        return 1
+    fi
+}
+
+# Store manifest in GitOps directory structure
+store_manifest() {
+    local cluster_name=$1
+    local namespace=$2
+    local manifest_file=$3
+    
+    # Create GitOps directory structure
+    local cluster_dir="$CLUSTERS_DIR/$namespace/$cluster_name"
+    mkdir -p "$cluster_dir"
+    
+    # Copy manifest
+    cp "$manifest_file" "$cluster_dir/cluster.yaml"
+    
+    # Create kustomization.yaml for GitOps
+    cat > "$cluster_dir/kustomization.yaml" <<EOF
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - cluster.yaml
+
+commonLabels:
+  cluster-name: $cluster_name
+  managed-by: nkp-cluster-script
+EOF
+
+    echo "  ✓ Stored manifest: $cluster_dir/cluster.yaml"
+}
+
+# ============================================================================
+# CSV PARSING
+# ============================================================================
+
+# Parse CSV file and create clusters
+# Expected CSV format (header row required):
+# cluster_name,namespace,control_plane_ip,service_lb_range,control_plane_replicas,worker_replicas
+create_from_csv() {
+    local csv_file=$1
+    local apply_manifests="${2:-false}"
+    
+    if [ ! -f "$csv_file" ]; then
+        echo "ERROR: CSV file not found: $csv_file"
+        exit 1
+    fi
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating NKP clusters from CSV: $csv_file"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    local total=0
+    local created=0
+    local failed=0
+    local start_time=$(date +%s)
+    
+    # Read CSV file (skip header)
+    local line_num=0
+    while IFS=',' read -r cluster_name namespace control_plane_ip service_lb_range cp_replicas worker_reps || [ -n "$cluster_name" ]; do
+        line_num=$((line_num + 1))
+        
+        # Skip header row
+        if [ $line_num -eq 1 ]; then
+            # Verify header format
+            if [[ "$cluster_name" == "cluster_name" ]]; then
+                echo "Detected CSV header, skipping..."
+                continue
+            fi
+        fi
+        
+        # Skip empty lines
+        if [ -z "$cluster_name" ]; then
+            continue
+        fi
+        
+        # Trim whitespace
+        cluster_name=$(echo "$cluster_name" | xargs)
+        namespace=$(echo "${namespace:-$DEFAULT_NAMESPACE}" | xargs)
+        control_plane_ip=$(echo "$control_plane_ip" | xargs)
+        service_lb_range=$(echo "$service_lb_range" | xargs)
+        cp_replicas=$(echo "${cp_replicas:-$CONTROL_PLANE_REPLICAS}" | xargs)
+        worker_reps=$(echo "${worker_reps:-$WORKER_REPLICAS}" | xargs)
+        
+        total=$((total + 1))
+        
+        echo ""
+        echo "[$total] Processing: $cluster_name"
+        echo "  Namespace:           $namespace"
+        echo "  Control Plane IP:    $control_plane_ip"
+        echo "  Service LB Range:    $service_lb_range"
+        echo "  Control Plane Nodes: $cp_replicas"
+        echo "  Worker Nodes:        $worker_reps"
+        
+        # Override replicas from CSV
+        CONTROL_PLANE_REPLICAS="$cp_replicas"
+        WORKER_REPLICAS="$worker_reps"
+        
+        # Generate manifest
+        local manifest_file=$(mktemp)
+        
+        if generate_cluster_manifest "$cluster_name" "$namespace" "$control_plane_ip" "$service_lb_range" "$manifest_file"; then
+            # Store for GitOps
+            store_manifest "$cluster_name" "$namespace" "$manifest_file"
+            
+            # Apply if requested
+            if [ "$apply_manifests" = "true" ]; then
+                echo "  Applying manifest to management cluster..."
+                if kubectl --kubeconfig "$MGMT_KUBECONFIG" apply -f "$manifest_file" 2>/dev/null; then
+                    echo "  ✓ Applied successfully"
+                    created=$((created + 1))
+                else
+                    echo "  ✗ Failed to apply"
+                    failed=$((failed + 1))
+                fi
+            else
+                created=$((created + 1))
+            fi
+        else
+            failed=$((failed + 1))
+        fi
+        
+        rm -f "$manifest_file"
+        
+    done < "$csv_file"
+    
+    local end_time=$(date +%s)
+    local total_time=$((end_time - start_time))
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Summary:"
+    echo "  Total processed: $total"
+    echo "  Succeeded:       $created"
+    echo "  Failed:          $failed"
+    echo "  Time:            ${total_time}s"
+    echo "  Manifests:       $CLUSTERS_DIR/"
+    echo "════════════════════════════════════════════════════════════════"
+}
+
+# ============================================================================
+# COMMAND IMPLEMENTATIONS
+# ============================================================================
+
+cmd_setup() {
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Nutanix NKP Setup"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    check_kubectl
+    check_nkp
+    
+    echo ""
+    echo "NKP CLI version:"
+    nkp version 2>/dev/null || echo "  (version command not available)"
+    
+    echo ""
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+    
+    echo ""
+    echo "Configuration:"
+    echo "  Kubeconfig:              $MGMT_KUBECONFIG"
+    echo "  Clusters directory:      $CLUSTERS_DIR"
+    echo "  Nutanix endpoint:        ${NUTANIX_ENDPOINT:-<not set>}"
+    echo "  Prism Element cluster:   ${NUTANIX_PRISM_ELEMENT_CLUSTER:-<not set>}"
+    echo "  Subnet:                  ${NUTANIX_SUBNET:-<not set>}"
+    echo "  VM Image:                ${NUTANIX_VM_IMAGE:-<not set>}"
+    echo "  Storage container:       ${NUTANIX_STORAGE_CONTAINER:-<not set>}"
+    echo "  Kubernetes version:      ${KUBERNETES_VERSION:-<not set>}"
+    
+    echo ""
+    echo "✓ Setup complete"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Create a config file or set environment variables"
+    echo "  2. Create clusters: $0 create --cluster-name my-cluster ..."
+    echo "  3. Or use CSV:      $0 create --csv-file clusters.csv"
+}
+
+cmd_create() {
+    # Parse arguments
+    POSITIONAL_ARGS=()
+    parse_args "$@"
+    set -- "${POSITIONAL_ARGS[@]:-}"
+    
+    # Load config file if specified
+    if [ -n "${CONFIG_FILE:-}" ]; then
+        load_config "$CONFIG_FILE"
+    else
+        load_config
+    fi
+    
+    check_kubectl
+    check_nkp
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+    
+    # Create clusters directory
+    mkdir -p "$CLUSTERS_DIR"
+    
+    # Check if using CSV file
+    if [ -n "${CSV_FILE:-}" ]; then
+        create_from_csv "$CSV_FILE" "${APPLY_MANIFESTS:-false}"
+        return
+    fi
+    
+    # Single cluster creation
+    if [ -z "${CLUSTER_NAME:-}" ]; then
+        echo "ERROR: --cluster-name is required"
+        echo ""
+        echo "Usage: $0 create --cluster-name <name> --control-plane-endpoint-ip <ip> [options]"
+        echo "   or: $0 create --csv-file <file.csv>"
+        exit 1
+    fi
+    
+    if [ -z "${CONTROL_PLANE_ENDPOINT_IP:-}" ]; then
+        echo "ERROR: --control-plane-endpoint-ip is required"
+        exit 1
+    fi
+    
+    local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating NKP cluster: $CLUSTER_NAME"
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  Namespace:           $namespace"
+    echo "  Control Plane IP:    $CONTROL_PLANE_ENDPOINT_IP"
+    echo "  Service LB Range:    ${SERVICE_LB_IP_RANGE:-<auto>}"
+    echo "  Control Plane Nodes: $CONTROL_PLANE_REPLICAS"
+    echo "  Worker Nodes:        $WORKER_REPLICAS"
+    echo ""
+    
+    # Ensure namespace exists
+    if [ "${APPLY_MANIFESTS:-false}" = "true" ]; then
+        if ! kubectl --kubeconfig "$MGMT_KUBECONFIG" get namespace "$namespace" &>/dev/null; then
+            echo "Creating namespace: $namespace"
+            kubectl --kubeconfig "$MGMT_KUBECONFIG" create namespace "$namespace"
+        fi
+    fi
+    
+    # Generate manifest
+    local manifest_file=$(mktemp)
+    
+    if generate_cluster_manifest "$CLUSTER_NAME" "$namespace" "$CONTROL_PLANE_ENDPOINT_IP" "${SERVICE_LB_IP_RANGE:-}" "$manifest_file"; then
+        # Store for GitOps
+        store_manifest "$CLUSTER_NAME" "$namespace" "$manifest_file"
+        
+        # Apply if requested
+        if [ "${APPLY_MANIFESTS:-false}" = "true" ]; then
+            echo ""
+            echo "Applying manifest to management cluster..."
+            if kubectl --kubeconfig "$MGMT_KUBECONFIG" apply -f "$manifest_file"; then
+                echo ""
+                echo "✓ Cluster created successfully"
+            else
+                echo ""
+                echo "✗ Failed to apply manifest"
+                rm -f "$manifest_file"
+                exit 1
+            fi
+        else
+            echo ""
+            echo "✓ Manifest generated (dry-run mode)"
+            echo "  To apply: kubectl --kubeconfig $MGMT_KUBECONFIG apply -f $CLUSTERS_DIR/$namespace/$CLUSTER_NAME/cluster.yaml"
+        fi
+    else
+        echo "✗ Failed to generate manifest"
+        rm -f "$manifest_file"
+        exit 1
+    fi
+    
+    rm -f "$manifest_file"
+}
+
+cmd_verify() {
+    POSITIONAL_ARGS=()
+    parse_args "$@"
+    
+    local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+    
+    check_kubectl
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Verifying NKP clusters"
+    echo "Namespace:  $namespace"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if ! kubectl --kubeconfig "$MGMT_KUBECONFIG" get namespace "$namespace" &>/dev/null; then
+        echo "Namespace $namespace does not exist"
+        exit 1
+    fi
+    
+    echo ""
+    echo "Clusters in management cluster:"
+    kubectl --kubeconfig "$MGMT_KUBECONFIG" get clusters -n "$namespace" 2>/dev/null || echo "  No clusters found"
+    
+    echo ""
+    echo "Local manifests:"
+    if [ -d "$CLUSTERS_DIR/$namespace" ]; then
+        local count=$(find "$CLUSTERS_DIR/$namespace" -name "cluster.yaml" 2>/dev/null | wc -l | tr -d ' ')
+        echo "  Found $count cluster manifests in: $CLUSTERS_DIR/$namespace/"
+        ls -1 "$CLUSTERS_DIR/$namespace" 2>/dev/null | head -20
+    else
+        echo "  No local manifests found"
+    fi
+}
+
+cmd_cleanup() {
+    POSITIONAL_ARGS=()
+    parse_args "$@"
+    
+    local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+    local cluster_name="${CLUSTER_NAME:-}"
+    
+    check_kubectl
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Cleaning up NKP clusters"
+    echo "Namespace: $namespace"
+    if [ -n "$cluster_name" ]; then
+        echo "Cluster:   $cluster_name"
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if [ -n "$cluster_name" ]; then
+        # Delete specific cluster
+        echo "Deleting cluster: $cluster_name"
+        kubectl --kubeconfig "$MGMT_KUBECONFIG" delete cluster "$cluster_name" -n "$namespace" --wait=false 2>/dev/null || true
+        
+        # Remove local manifest
+        if [ -d "$CLUSTERS_DIR/$namespace/$cluster_name" ]; then
+            rm -rf "$CLUSTERS_DIR/$namespace/$cluster_name"
+            echo "✓ Removed local manifest"
+        fi
+    else
+        # Delete all clusters with our label
+        echo "Deleting all managed clusters in namespace: $namespace"
+        kubectl --kubeconfig "$MGMT_KUBECONFIG" delete clusters -n "$namespace" -l managed-by=nkp-cluster-script --wait=false 2>/dev/null || true
+        
+        # Remove all local manifests for namespace
+        if [ -d "$CLUSTERS_DIR/$namespace" ]; then
+            rm -rf "$CLUSTERS_DIR/$namespace"
+            echo "✓ Removed local manifests"
+        fi
+    fi
+    
+    echo ""
+    echo "✓ Cleanup initiated"
+}
+
+cmd_list() {
+    POSITIONAL_ARGS=()
+    parse_args "$@"
+    
+    local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+    
+    check_kubectl
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "NKP Clusters"
+    echo "Namespace: $namespace"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    echo ""
+    echo "Clusters in management cluster:"
+    kubectl --kubeconfig "$MGMT_KUBECONFIG" get clusters -n "$namespace" -o wide 2>/dev/null || echo "  No clusters found"
+    
+    echo ""
+    echo "Local manifests:"
+    if [ -d "$CLUSTERS_DIR" ]; then
+        echo "  Directory: $CLUSTERS_DIR"
+        find "$CLUSTERS_DIR" -name "cluster.yaml" -exec dirname {} \; 2>/dev/null | sort | while read -r dir; do
+            local name=$(basename "$dir")
+            local ns=$(basename "$(dirname "$dir")")
+            echo "    - $ns/$name"
+        done
+    else
+        echo "  No local manifests found"
+    fi
+}
+
+cmd_export() {
+    POSITIONAL_ARGS=()
+    parse_args "$@"
+    set -- "${POSITIONAL_ARGS[@]:-}"
+    
+    local cluster_name="${CLUSTER_NAME:-$1}"
+    local output_file="${2:-}"
+    
+    if [ -z "$cluster_name" ]; then
+        echo "ERROR: Usage: $0 export --cluster-name <name> [output-file]"
+        exit 1
+    fi
+    
+    load_config
+    check_nkp
+    
+    output_file="${output_file:-${cluster_name}.yaml}"
+    
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Exporting NKP cluster manifest"
+    echo "Cluster: $cluster_name"
+    echo "Output:  $output_file"
+    echo "════════════════════════════════════════════════════════════════"
+    
+    if [ -z "${CONTROL_PLANE_ENDPOINT_IP:-}" ]; then
+        echo "ERROR: --control-plane-endpoint-ip is required for export"
+        exit 1
+    fi
+    
+    if generate_cluster_manifest "$cluster_name" "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$CONTROL_PLANE_ENDPOINT_IP" "${SERVICE_LB_IP_RANGE:-}" "$output_file"; then
+        echo ""
+        echo "✓ Manifest exported to: $output_file"
+    else
+        echo "✗ Failed to export manifest"
+        exit 1
+    fi
+}
+
+cmd_generate_csv_template() {
+    local output_file="${1:-clusters.csv}"
+    
+    cat > "$output_file" <<'EOF'
+cluster_name,namespace,control_plane_ip,service_lb_range,control_plane_replicas,worker_replicas
+nkp-cluster-001,dm-dev-workspace,10.0.1.100,10.1.1.100-10.1.1.110,3,3
+nkp-cluster-002,dm-dev-workspace,10.0.1.101,10.1.1.111-10.1.1.121,3,3
+nkp-cluster-003,dm-dev-workspace,10.0.1.102,10.1.1.122-10.1.1.132,3,3
+EOF
+    
+    echo "✓ Generated CSV template: $output_file"
+    echo ""
+    echo "Edit this file with your cluster configurations, then run:"
+    echo "  $0 create --csv-file $output_file"
+    echo ""
+    echo "To also apply manifests to management cluster:"
+    echo "  $0 create --csv-file $output_file --apply"
+}
+
+cmd_help() {
+    cat <<EOF
+Nutanix NKP Cluster Management
+
+Creates NKP clusters using the NKP CLI with --dry-run to generate manifests,
+stores them in a GitOps-friendly directory structure, and optionally applies
+them to the management cluster.
+
+Usage: $0 <command> [options]
+
+Commands:
+  setup                         Verify prerequisites and show configuration
+
+  create [options]              Create NKP cluster(s)
+    Single cluster:
+      --cluster-name, -c NAME   Cluster name (required)
+      --namespace, -n NS        Namespace (default: $DEFAULT_NAMESPACE)
+      --control-plane-endpoint-ip IP  Control plane VIP (required)
+      --service-lb-ip-range RANGE     Service LoadBalancer IP range
+      --control-plane-replicas N      Control plane nodes (default: $CONTROL_PLANE_REPLICAS)
+      --worker-replicas N             Worker nodes (default: $WORKER_REPLICAS)
+      --apply                         Apply manifests to management cluster
+      --dry-run                       Only generate manifests (default)
+    
+    Batch creation from CSV:
+      --csv-file FILE           CSV file with cluster configurations
+      --apply                   Apply all manifests to management cluster
+    
+    Nutanix settings (or set via env vars):
+      --endpoint HOST           Nutanix Prism Central endpoint
+      --port PORT               Nutanix port (default: 9440)
+      --prism-element-cluster NAME  Prism Element cluster name
+      --subnet NAME             Subnet name
+      --storage-container NAME  Storage container name
+      --vm-image NAME           VM image name
+      --ssh-public-key-file FILE  SSH public key file
+    
+    Other settings:
+      --kubernetes-version VER  Kubernetes version (default: $KUBERNETES_VERSION)
+      --worker-vcpus N          Worker vCPUs (default: $WORKER_VCPUS)
+      --registry-url URL        Container registry URL
+      --registry-username USER  Registry username
+      --registry-password PASS  Registry password
+      --kubeconfig FILE         Management cluster kubeconfig
+      --config FILE             Configuration file to load
+
+  verify [options]              Verify clusters
+      --namespace, -n NS        Namespace to verify
+
+  cleanup [options]             Delete clusters
+      --namespace, -n NS        Namespace
+      --cluster-name, -c NAME   Specific cluster (or all if not specified)
+
+  list [options]                List all clusters
+      --namespace, -n NS        Namespace to list
+
+  export [options]              Export single cluster manifest
+      --cluster-name, -c NAME   Cluster name (required)
+      --control-plane-endpoint-ip IP  (required)
+
+  csv-template [FILE]           Generate sample CSV template
+                                FILE: Output file (default: clusters.csv)
+
+  help                          Show this help message
+
+Environment Variables:
+  MGMT_KUBECONFIG               Management cluster kubeconfig
+  CLUSTERS_DIR                  Directory for storing manifests (default: ./clusters)
+  
+  NUTANIX_ENDPOINT              Nutanix Prism Central endpoint
+  NUTANIX_PORT                  Nutanix port (default: 9440)
+  NUTANIX_PRISM_ELEMENT_CLUSTER Prism Element cluster name
+  NUTANIX_SUBNET                Subnet name
+  NUTANIX_STORAGE_CONTAINER     Storage container name
+  NUTANIX_VM_IMAGE              VM image name
+  NUTANIX_SSH_KEY_FILE          SSH public key file
+  
+  KUBERNETES_VERSION            Kubernetes version
+  CONTROL_PLANE_REPLICAS        Default control plane replicas
+  WORKER_REPLICAS               Default worker replicas
+  WORKER_VCPUS                  Default worker vCPUs
+  
+  REGISTRY_URL                  Container registry URL
+  REGISTRY_USERNAME             Registry username
+  REGISTRY_PASSWORD             Registry password
+
+Configuration File:
+  Create nkp.config in the script directory or specify with --config:
+  
+    # nkp.config example
+    NUTANIX_ENDPOINT="prism.example.com"
+    NUTANIX_PRISM_ELEMENT_CLUSTER="pe-cluster-1"
+    NUTANIX_SUBNET="vm-network"
+    NUTANIX_STORAGE_CONTAINER="default-container"
+    NUTANIX_VM_IMAGE="nkp-ubuntu-22.04"
+    NUTANIX_SSH_KEY_FILE="\$HOME/.ssh/id_rsa.pub"
+
+Examples:
+  # Generate CSV template
+  $0 csv-template
+
+  # Create clusters from CSV (manifests only)
+  $0 create --csv-file clusters.csv
+
+  # Create clusters from CSV and apply to management cluster
+  $0 create --csv-file clusters.csv --apply
+
+  # Create single cluster
+  $0 create \\
+    --cluster-name my-cluster \\
+    --control-plane-endpoint-ip 10.0.1.100 \\
+    --service-lb-ip-range 10.1.1.100-10.1.1.110
+
+  # Create and apply single cluster
+  $0 create \\
+    --cluster-name my-cluster \\
+    --control-plane-endpoint-ip 10.0.1.100 \\
+    --apply
+
+  # List clusters
+  $0 list --namespace dm-dev-workspace
+
+  # Cleanup specific cluster
+  $0 cleanup --cluster-name my-cluster
+
+Output Structure:
+  Manifests are stored in GitOps-friendly structure:
+  
+    clusters/
+    └── <namespace>/
+        └── <cluster-name>/
+            ├── cluster.yaml      # NKP cluster manifest
+            └── kustomization.yaml # Kustomize file
+
+EOF
+}
+
+# ============================================================================
+# MAIN COMMAND DISPATCHER
+# ============================================================================
+
+COMMAND="${1:-help}"
+shift || true
+
+case "$COMMAND" in
+    setup)
+        cmd_setup
+        ;;
+    create)
+        cmd_create "$@"
+        ;;
+    verify)
+        cmd_verify "$@"
+        ;;
+    cleanup)
+        cmd_cleanup "$@"
+        ;;
+    list)
+        cmd_list "$@"
+        ;;
+    export)
+        cmd_export "$@"
+        ;;
+    csv-template)
+        cmd_generate_csv_template "$@"
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        echo "ERROR: Unknown command: $COMMAND"
+        echo ""
+        cmd_help
+        exit 1
+        ;;
+esac

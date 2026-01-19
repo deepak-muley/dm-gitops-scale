@@ -4,7 +4,7 @@ Scale testing tools for Cluster API (CAPI) and GitOps workflows. This repository
 
 ## Overview
 
-This repository contains implementations of 5 different scale testing approaches, each optimized for different use cases:
+This repository contains implementations of 6 different scale testing approaches, each optimized for different use cases:
 
 | Method | Resources per "Cluster" | Best For | Folder |
 |--------|------------------------|----------|--------|
@@ -13,6 +13,27 @@ This repository contains implementations of 5 different scale testing approaches
 | **vcluster** | ~128MB/cluster | Testing actual workloads in isolation | [`vcluster/`](./vcluster/) |
 | **Kubemark** | ~50MB/node | API server load testing | [`kubemark/`](./kubemark/) |
 | **kube-burner** | Variable | High-throughput object creation | [`kube-burner/`](./kube-burner/) |
+| **Nutanix NKP** | ~1KB/object | NKP-specific GitOps testing | [`nutanix-nkp/`](./nutanix-nkp/) |
+
+### Adding New Methods
+
+Want to add your own cluster creation method? Use the template:
+
+```bash
+# Copy the template folder
+cp -r cluster-create-template your-method-name
+
+# Rename and customize
+mv your-method-name/template-cluster your-method-name/your-method-cluster
+chmod +x your-method-name/your-method-cluster
+
+# Set your management cluster kubeconfig
+export MGMT_KUBECONFIG=/path/to/management-cluster-kubeconfig
+
+# Edit the script and README to implement your CLI's --dry-run workflow
+```
+
+See [`docs/ADDING-NEW-METHODS.md`](./docs/ADDING-NEW-METHODS.md) for detailed instructions.
 
 ## Quick Start
 
@@ -71,25 +92,34 @@ Some cluster types have additional commands:
 
 ```
 .
-├── README.md                 # This file
+├── README.md                    # This file
 ├── docs/
-│   └── SCALE-TESTING.md      # Detailed documentation
-├── kwok/                     # KWOK implementation
-│   ├── kwok-cluster          # Unified command script
+│   ├── SCALE-TESTING.md         # Detailed documentation
+│   └── ADDING-NEW-METHODS.md    # Guide for adding new methods
+├── cluster-create-template/     # Template for creating new methods
+│   ├── template-cluster         # Template script (copy and customize)
+│   ├── README.md                # Template documentation
+│   └── templates/
+│       └── cluster.yaml.template
+├── kwok/                        # KWOK implementation
+│   ├── kwok-cluster             # Unified command script
 │   └── README.md
-├── paused-capi/              # Paused CAPI objects
-│   ├── paused-capi-cluster   # Unified command script
+├── paused-capi/                 # Paused CAPI objects
+│   ├── paused-capi-cluster      # Unified command script
 │   └── README.md
-├── vcluster/                 # Virtual clusters
-│   ├── vcluster-cluster       # Unified command script
+├── vcluster/                    # Virtual clusters
+│   ├── vcluster-cluster         # Unified command script
 │   └── README.md
-├── kubemark/                 # Kubemark hollow nodes
-│   ├── kubemark-cluster      # Unified command script
+├── kubemark/                    # Kubemark hollow nodes
+│   ├── kubemark-cluster         # Unified command script
 │   └── README.md
-└── kube-burner/              # kube-burner load testing
-    ├── kube-burner-cluster   # Unified command script
-    ├── templates/
-    │   └── cluster.yaml
+├── kube-burner/                 # kube-burner load testing
+│   ├── kube-burner-cluster      # Unified command script
+│   ├── templates/
+│   │   └── cluster.yaml
+│   └── README.md
+└── nutanix-nkp/                 # Nutanix NKP (uses nkp CLI --dry-run)
+    ├── nkp-cluster              # Unified command script
     └── README.md
 ```
 
@@ -161,6 +191,7 @@ Each method has different prerequisites. Check the README in each folder:
 - **vcluster**: Requires `vcluster` CLI - see [vcluster/README.md](./vcluster/README.md)
 - **Kubemark**: Requires Kubernetes cluster - see [kubemark/README.md](./kubemark/README.md)
 - **kube-burner**: Requires `kube-burner` CLI - see [kube-burner/README.md](./kube-burner/README.md)
+- **Nutanix NKP**: Requires `kubectl` and `kind` - see [nutanix-nkp/README.md](./nutanix-nkp/README.md)
 
 ## Configuration
 
@@ -215,6 +246,8 @@ kubectl top pods -n dm-dev-workspace --sum
 ## Documentation
 
 - **Detailed Guide**: See [docs/SCALE-TESTING.md](./docs/SCALE-TESTING.md) for comprehensive documentation
+- **Scaling Deep Dive**: See [docs/CLUSTER-API-SCALING-DEEP-DIVE.md](./docs/CLUSTER-API-SCALING-DEEP-DIVE.md) for component limits, metrics, and architecture patterns
+- **Solutions & Fixes**: See [docs/CAPI-SCALING-SOLUTIONS-AND-FIXES.md](./docs/CAPI-SCALING-SOLUTIONS-AND-FIXES.md) for actionable fixes and tuning
 - **Method-Specific**: Each folder contains a README with method-specific instructions
 
 ## Troubleshooting
