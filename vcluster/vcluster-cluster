@@ -7,6 +7,8 @@ set -euo pipefail
 
 DEFAULT_PREFIX="vcluster"
 KIND_CLUSTER_NAME="vcluster-host"
+HOST_CLUSTER_CONTEXT="${VCLUSTER_HOST_CONTEXT:-}"
+USE_KIND_CLUSTER="${USE_KIND_CLUSTER:-false}"
 
 check_vcluster() {
     if ! command -v vcluster &> /dev/null; then
@@ -39,11 +41,16 @@ check_kind() {
     fi
 }
 
+# Get current kubectl context
+get_current_context() {
+    kubectl config current-context 2>/dev/null || echo ""
+}
+
 # Ensure kind cluster exists and switch context to it
 ensure_kind_cluster() {
     check_kind
     check_kubectl
-    
+
     # Check if kind cluster exists
     if ! kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
         echo "Creating kind cluster: $KIND_CLUSTER_NAME"
@@ -52,7 +59,7 @@ ensure_kind_cluster() {
     else
         echo "Kind cluster $KIND_CLUSTER_NAME already exists"
     fi
-    
+
     # Switch to the kind cluster context
     kubectl config use-context "kind-${KIND_CLUSTER_NAME}" 2>/dev/null || {
         echo "Warning: Could not switch to kind cluster context"
@@ -61,7 +68,7 @@ ensure_kind_cluster() {
         echo ""
         echo "Trying to use kind cluster directly..."
     }
-    
+
     # Verify we can connect
     if kubectl cluster-info &>/dev/null; then
         echo "✓ Connected to kind cluster: $KIND_CLUSTER_NAME"
@@ -72,110 +79,635 @@ ensure_kind_cluster() {
     fi
 }
 
-# Setup/bootstrap: Create kind cluster
+# Ensure cluster context is set and accessible
+# Priority: 1. USE_KIND_CLUSTER (explicit), 2. HOST_CLUSTER_CONTEXT, 3. Current kubectl context, 4. Kind cluster
+ensure_cluster() {
+    check_kubectl
+
+    local context_to_use=""
+    local cluster_name=""
+
+    # Check if we should use kind cluster (highest priority for explicit choice)
+    if [ "$USE_KIND_CLUSTER" = "true" ] || [ "$USE_KIND_CLUSTER" = "yes" ]; then
+        ensure_kind_cluster
+        return 0
+    # Check if we should use a specific context from env var or --context flag
+    elif [ -n "$HOST_CLUSTER_CONTEXT" ]; then
+        context_to_use="$HOST_CLUSTER_CONTEXT"
+        cluster_name="$HOST_CLUSTER_CONTEXT"
+        echo "Using cluster context: $context_to_use"
+    # Try to use current kubectl context
+    else
+        context_to_use=$(get_current_context)
+        if [ -n "$context_to_use" ]; then
+            cluster_name="$context_to_use"
+            echo "Using current kubectl context: $context_to_use"
+        else
+            # Fallback to kind cluster
+            echo "No kubectl context found, falling back to kind cluster"
+            ensure_kind_cluster
+            return 0
+        fi
+    fi
+
+    # Switch to the specified context
+    if [ -n "$context_to_use" ]; then
+        if kubectl config use-context "$context_to_use" 2>/dev/null; then
+            echo "✓ Switched to context: $context_to_use"
+        else
+            echo "ERROR: Could not switch to context: $context_to_use"
+            echo "Available contexts:"
+            kubectl config get-contexts
+            exit 1
+        fi
+    fi
+
+    # Verify we can connect
+    if kubectl cluster-info &>/dev/null; then
+        echo "✓ Connected to cluster: $cluster_name"
+    else
+        echo "ERROR: Cannot connect to cluster: $cluster_name"
+        echo "Please check your KUBECONFIG and cluster connectivity"
+        exit 1
+    fi
+}
+
+# Setup/bootstrap: Ensure cluster is ready
 cmd_setup() {
-    ensure_kind_cluster
-    
-    echo ""
-    echo "✓ Setup complete"
-    echo ""
-    echo "Kind cluster '$KIND_CLUSTER_NAME' is ready for vclusters"
+    local USE_KIND="${1:-false}"
+
+    if [ "$USE_KIND" = "true" ] || [ "$USE_KIND" = "yes" ]; then
+        USE_KIND_CLUSTER="true"
+        ensure_kind_cluster
+        echo ""
+        echo "✓ Setup complete"
+        echo ""
+        echo "Kind cluster '$KIND_CLUSTER_NAME' is ready for vclusters"
+    else
+        ensure_cluster
+        echo ""
+        echo "✓ Setup complete"
+        echo ""
+        local current_ctx=$(get_current_context)
+        echo "Cluster '$current_ctx' is ready for vclusters"
+    fi
     echo "You can now create vclusters with: $0 create"
 }
 
 cmd_create() {
-    local COUNT="${1:-10}"
-    local NAMESPACE_PREFIX="${2:-$DEFAULT_PREFIX}"
-    
+    # Parse arguments - support both positional and named parameters
+    local COUNT=10
+    local NAMESPACE_PREFIX="$DEFAULT_PREFIX"
+    local CONTROL_PLANE_REPLICAS=""
+    local SYNCER_REPLICAS=""
+    local KUBERNETES_VERSION=""
+    local HELM_VALUES_FILE=""
+    local HELM_SET_ARGS=()
+    local POS_ARG1=""
+    local POS_ARG2=""
+    local POS_ARG3=""
+    local POS_ARG4=""
+    local POS_ARG5=""
+
+    # Parse positional and named arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --count|-c)
+                COUNT="$2"
+                shift 2
+                ;;
+            --prefix|-p)
+                NAMESPACE_PREFIX="$2"
+                shift 2
+                ;;
+            --control-plane-replicas|--cp-replicas)
+                CONTROL_PLANE_REPLICAS="$2"
+                shift 2
+                ;;
+            --syncer-replicas|--syncer-replicas)
+                SYNCER_REPLICAS="$2"
+                shift 2
+                ;;
+            --kubernetes-version|--k8s-version|-k)
+                KUBERNETES_VERSION="$2"
+                shift 2
+                ;;
+            --values|-f)
+                HELM_VALUES_FILE="$2"
+                shift 2
+                ;;
+            --set)
+                HELM_SET_ARGS+=("--set" "$2")
+                shift 2
+                ;;
+            --*)
+                echo "ERROR: Unknown option: $1"
+                echo "Use --help to see available options"
+                exit 1
+                ;;
+            *)
+                # Positional arguments: COUNT [PREFIX] [CONTROL_PLANE_REPLICAS] [SYNCER_REPLICAS] [KUBERNETES_VERSION]
+                # Track which positional args we've seen
+                if [[ -z "${POS_ARG1:-}" ]]; then
+                    POS_ARG1="$1"
+                    COUNT="$1"
+                elif [[ -z "${POS_ARG2:-}" ]]; then
+                    POS_ARG2="$1"
+                    NAMESPACE_PREFIX="$1"
+                elif [[ -z "${POS_ARG3:-}" ]]; then
+                    POS_ARG3="$1"
+                    CONTROL_PLANE_REPLICAS="$1"
+                elif [[ -z "${POS_ARG4:-}" ]]; then
+                    POS_ARG4="$1"
+                    SYNCER_REPLICAS="$1"
+                elif [[ -z "${POS_ARG5:-}" ]]; then
+                    POS_ARG5="$1"
+                    KUBERNETES_VERSION="$1"
+                else
+                    echo "ERROR: Too many positional arguments"
+                    echo "Expected: COUNT [PREFIX] [CONTROL_PLANE_REPLICAS] [SYNCER_REPLICAS] [KUBERNETES_VERSION]"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
     check_vcluster
     check_kubectl
-    
-    # Ensure kind cluster exists
-    ensure_kind_cluster
-    
+
+    # Ensure cluster is ready
+    ensure_cluster
+
+    # Build vcluster create command with Helm options
+    # Note: --update-current is deprecated, removed it
+    local VCLUSTER_CMD_ARGS=("--connect=false")
+
+    # Note: Control plane replicas configuration via Helm values is not consistently supported
+    # across all vcluster versions. The Helm chart structure varies significantly.
+    # We'll skip setting it automatically and let users use --set if needed.
+    # If CONTROL_PLANE_REPLICAS is set, we'll warn but not apply it automatically.
+    if [ -n "$CONTROL_PLANE_REPLICAS" ]; then
+        echo "  ⚠ Warning: Control plane replicas setting may not be supported in your vcluster version."
+        echo "     The Helm chart structure varies by version. If you need to set replicas,"
+        echo "     use --set with the correct path for your version, e.g.:"
+        echo "       --set api.replicas=$CONTROL_PLANE_REPLICAS"
+        echo "       --set controlPlane.replicas=$CONTROL_PLANE_REPLICAS"
+        echo "     Or check: helm show values loft-sh/vcluster"
+        echo ""
+        # Don't automatically set it - let users use --set if they know the correct path
+        # VCLUSTER_CMD_ARGS+=("--set" "replicas=$CONTROL_PLANE_REPLICAS")
+    fi
+
+    # Add syncer replicas if specified
+    if [ -n "$SYNCER_REPLICAS" ]; then
+        VCLUSTER_CMD_ARGS+=("--set" "syncer.replicas=$SYNCER_REPLICAS")
+    fi
+
+    # Add Kubernetes version if specified, or use default latest
+    # vcluster uses the Kubernetes API server image tag to determine the version
+    # The Helm value path may vary by vcluster version, so we try common paths
+    local k8s_version=""
+    if [ -z "$KUBERNETES_VERSION" ]; then
+        # Default to a recent stable Kubernetes version
+        # Note: v1.29.0 is a recent stable version as of 2024
+        # Users can override with --kubernetes-version if needed
+        k8s_version="v1.29.0"
+        echo "  → No Kubernetes version specified, using default: $k8s_version"
+        echo "     To specify a different version, use: --kubernetes-version <version>"
+        echo ""
+    else
+        # Normalize version format (remove 'v' prefix if present, add it back)
+        k8s_version="${KUBERNETES_VERSION#v}"
+        k8s_version="v${k8s_version}"
+        echo "  → Setting Kubernetes version to $k8s_version"
+        echo "     Note: The Helm value path may vary by vcluster chart version."
+        echo "     If this fails, check: helm show values loft-sh/vcluster"
+        echo "     Common paths: api.image.tag, image.tag, or api.image.repository"
+        echo ""
+    fi
+
+    # Add the Kubernetes version to Helm values
+    # Try the most common path first (api.image.tag)
+    VCLUSTER_CMD_ARGS+=("--set" "api.image.tag=$k8s_version")
+
+    # Add Helm values file if specified
+    if [ -n "$HELM_VALUES_FILE" ]; then
+        if [ ! -f "$HELM_VALUES_FILE" ]; then
+            echo "ERROR: Helm values file not found: $HELM_VALUES_FILE"
+            exit 1
+        fi
+        VCLUSTER_CMD_ARGS+=("--values" "$HELM_VALUES_FILE")
+    fi
+
+    # Add custom --set arguments (only if array has elements)
+    # Use a safer check to avoid unbound variable errors with set -u
+    local helm_set_count=${#HELM_SET_ARGS[@]}
+    if [ "$helm_set_count" -gt 0 ]; then
+        VCLUSTER_CMD_ARGS+=("${HELM_SET_ARGS[@]}")
+    fi
+
     echo "════════════════════════════════════════════════════════════════"
     echo "Creating $COUNT virtual clusters..."
     echo "Namespace prefix: $NAMESPACE_PREFIX"
+    if [ -n "$CONTROL_PLANE_REPLICAS" ]; then
+        echo "Control plane replicas requested: $CONTROL_PLANE_REPLICAS"
+        echo "  Note: Not automatically applied (Helm chart structure varies by version)"
+        echo "  To set replicas, use --set with the correct path, e.g.:"
+        echo "    --set api.replicas=$CONTROL_PLANE_REPLICAS"
+    fi
+    if [ -n "$SYNCER_REPLICAS" ]; then
+        echo "Syncer replicas: $SYNCER_REPLICAS"
+    fi
+    # Always show Kubernetes version (default or specified)
+    local k8s_version_display=""
+    if [ -z "$KUBERNETES_VERSION" ]; then
+        k8s_version_display="v1.29.0 (default)"
+    else
+        k8s_version_display="${KUBERNETES_VERSION#v}"
+        k8s_version_display="v${k8s_version_display}"
+    fi
+    echo "Kubernetes version: $k8s_version_display"
+    if [ -z "$KUBERNETES_VERSION" ]; then
+        echo "  Note: Using default version. Override with --kubernetes-version if needed"
+    else
+        echo "  Note: Using Helm value: api.image.tag=$k8s_version_display"
+        echo "  If this fails, the path may differ. Check: helm show values loft-sh/vcluster"
+    fi
+    if [ -n "$HELM_VALUES_FILE" ]; then
+        echo "Helm values file: $HELM_VALUES_FILE"
+    fi
+    local helm_set_count=${#HELM_SET_ARGS[@]}
+    if [ "$helm_set_count" -gt 0 ]; then
+        echo "Custom Helm values: ${HELM_SET_ARGS[*]}"
+    fi
+    echo ""
+    echo "Note: vcluster does NOT have separate 'worker nodes'."
+    echo "      Workloads run in the host cluster's nodes."
+    echo "      Control plane = API server, Syncer = resource sync component"
     echo "════════════════════════════════════════════════════════════════"
-    
+
     start_time=$(date +%s)
     created=0
     failed=0
-    
+    skipped=0
+    CLEANUP_NAMESPACES=()
+    CLEANUP_COMMANDS=()
+
+    # Helper function to find next available namespace number
+    find_next_available_ns() {
+      local prefix="$1"
+      local start_num="$2"
+      local max_attempts=10000
+      local num=$start_num
+
+      while [ $num -le $max_attempts ]; do
+        local test_ns="${prefix}-$(printf "%04d" $num)"
+        # Check if namespace exists
+        if ! kubectl get namespace "$test_ns" &>/dev/null; then
+          echo "$num"
+          return 0
+        fi
+        # Check if vcluster exists in this namespace
+        local test_vc="vc-$(printf "%04d" $num)"
+        local vc_exists=false
+        if command -v jq &>/dev/null; then
+          if vcluster list --namespace "$test_ns" --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$test_vc\" and .Namespace==\"$test_ns\") | .Name" 2>/dev/null | grep -q "^$test_vc$"; then
+            vc_exists=true
+          fi
+        else
+          if vcluster list --namespace "$test_ns" 2>/dev/null | grep -q "$test_vc"; then
+            vc_exists=true
+          fi
+        fi
+        # If namespace exists but no vcluster, we can reuse it
+        if [ "$vc_exists" = "false" ]; then
+          echo "$num"
+          return 0
+        fi
+        num=$((num + 1))
+      done
+      echo ""
+      return 1
+    }
+
     for i in $(seq 1 $COUNT); do
       vc_name="vc-$(printf "%04d" $i)"
       ns="${NAMESPACE_PREFIX}-$(printf "%04d" $i)"
-      
-      echo "[$i/$COUNT] Creating virtual cluster: $vc_name in namespace $ns..."
-      
-      if ! kubectl get namespace "$ns" &>/dev/null; then
-        kubectl create namespace "$ns" 2>/dev/null || true
+      namespace_exists=false
+      vcluster_exists=false
+      actual_num=$i
+
+      echo "[$i/$COUNT] Processing: $vc_name in namespace $ns..."
+
+      # Check if namespace exists
+      if kubectl get namespace "$ns" &>/dev/null; then
+        namespace_exists=true
+        echo "  ⚠ Namespace $ns already exists"
+
+        # Check if vcluster already exists in this namespace
+        vcluster_exists=false
+        if command -v jq &>/dev/null; then
+          # Use jq if available (more reliable)
+          if vcluster list --namespace "$ns" --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$vc_name\" and .Namespace==\"$ns\") | .Name" 2>/dev/null | grep -q "^$vc_name$"; then
+            vcluster_exists=true
+          fi
+        else
+          # Fallback: check using vcluster list and grep
+          if vcluster list --namespace "$ns" 2>/dev/null | grep -q "$vc_name"; then
+            vcluster_exists=true
+          fi
+        fi
+
+        if [ "$vcluster_exists" = "true" ]; then
+          # vcluster exists - find next available namespace
+          echo "  ⚠ vcluster $vc_name already exists in namespace $ns"
+          echo "  → Finding next available namespace..."
+          next_num=$(find_next_available_ns "$NAMESPACE_PREFIX" $((i + 1)))
+          if [ -n "$next_num" ]; then
+            actual_num=$next_num
+            vc_name="vc-$(printf "%04d" $actual_num)"
+            ns="${NAMESPACE_PREFIX}-$(printf "%04d" $actual_num)"
+            echo "  → Using next available: $vc_name in namespace $ns"
+            namespace_exists=false
+          else
+            echo "  ✗ Could not find available namespace (searched up to ${NAMESPACE_PREFIX}-10000)"
+            failed=$((failed + 1))
+            continue
+          fi
+        else
+          # Namespace exists but no vcluster - reuse the namespace
+          echo "  ✓ Namespace $ns exists but no vcluster found - reusing namespace"
+          # Namespace already exists, so we can proceed to create vcluster
+          # namespace_exists is already true, so we won't try to create it again
+        fi
       fi
-      
-      if vcluster create "$vc_name" --namespace "$ns" --connect=false --update-current=false &>/dev/null; then
+
+      # Create namespace if it doesn't exist
+      if [ "$namespace_exists" = "false" ]; then
+        echo "  → Creating namespace $ns..."
+        # Use set +e temporarily to handle errors gracefully
+        set +e
+        NS_ERROR=$(kubectl create namespace "$ns" 2>&1)
+        NS_EXIT_CODE=$?
+        set -e
+
+        # Check if namespace was created (even if command had warnings/errors)
+        if kubectl get namespace "$ns" &>/dev/null; then
+          echo "  ✓ Created namespace $ns"
+          namespace_exists=true
+        elif [ $NS_EXIT_CODE -eq 0 ] || echo "$NS_ERROR" | grep -q "AlreadyExists"; then
+          # Command succeeded or namespace already exists - wait for it to be ready
+          echo "  → Namespace creation initiated, waiting for it to be ready..."
+          local wait_count=0
+          while [ $wait_count -lt 10 ] && ! kubectl get namespace "$ns" &>/dev/null; do
+            sleep 1
+            wait_count=$((wait_count + 1))
+          done
+          if kubectl get namespace "$ns" &>/dev/null; then
+            echo "  ✓ Created namespace $ns"
+            namespace_exists=true
+          else
+            echo "  ✗ Namespace creation timed out"
+            echo "  Error output: $NS_ERROR"
+            failed=$((failed + 1))
+            continue
+          fi
+        else
+          echo "  ✗ Failed to create namespace $ns"
+          echo "  Error: $NS_ERROR"
+          echo ""
+          echo "  Diagnostic:"
+          echo "  - Checking if namespace already exists:"
+          if kubectl get namespace "$ns" &>/dev/null; then
+            echo "    ⚠ Namespace $ns actually exists (race condition?)"
+            echo "    → Will proceed with existing namespace"
+            namespace_exists=true
+          else
+            echo "    ✓ Namespace does not exist"
+            echo "  - Checking cluster connectivity:"
+            if kubectl cluster-info &>/dev/null; then
+              echo "    ✓ Cluster is reachable"
+            else
+              echo "    ✗ Cannot reach cluster"
+            fi
+            echo "  - Checking RBAC permissions:"
+            if kubectl auth can-i create namespaces &>/dev/null; then
+              echo "    ✓ Has permission to create namespaces"
+            else
+              echo "    ✗ No permission to create namespaces (RBAC issue)"
+            fi
+            failed=$((failed + 1))
+            continue
+          fi
+        fi
+      fi
+
+      # Ensure we have a valid namespace before proceeding
+      if [ "$namespace_exists" = "false" ]; then
+        echo "  ✗ Cannot proceed without a valid namespace"
+        failed=$((failed + 1))
+        continue
+      fi
+
+      # Create vcluster
+      echo "  Creating vcluster $vc_name in namespace $ns..."
+      echo "  → This may take 30-60 seconds..."
+      VCLUSTER_ERROR_LOG=$(mktemp)
+      # Run vcluster create in background to show progress, but capture output
+      if vcluster create "$vc_name" --namespace "$ns" "${VCLUSTER_CMD_ARGS[@]}" > "$VCLUSTER_ERROR_LOG" 2>&1; then
         created=$((created + 1))
         echo "  ✓ Created $vc_name"
+        rm -f "$VCLUSTER_ERROR_LOG"
       else
         failed=$((failed + 1))
         echo "  ✗ Failed to create $vc_name"
+        echo ""
+        echo "  ════════════════════════════════════════════════════════════"
+        echo "  Error Details:"
+        echo "  ════════════════════════════════════════════════════════════"
+        cat "$VCLUSTER_ERROR_LOG" | sed 's/^/  /'
+        echo "  ════════════════════════════════════════════════════════════"
+        echo ""
+
+        # Check if error is related to Helm values
+        if grep -q "unable to parse key\|assignment to entry in nil map" "$VCLUSTER_ERROR_LOG" 2>/dev/null; then
+          echo "  ⚠ Helm Value Path Issue Detected:"
+          echo "     The Helm value path used may not be correct for your vcluster version."
+          if [ -n "$CONTROL_PLANE_REPLICAS" ]; then
+            echo "     Attempted: replicas=$CONTROL_PLANE_REPLICAS"
+            echo "     Try using --set with the correct path, e.g.:"
+            echo "       --set api.replicas=$CONTROL_PLANE_REPLICAS"
+            echo "       --set controlPlane.replicas=$CONTROL_PLANE_REPLICAS"
+            echo "     Or check your vcluster Helm chart values:"
+            echo "       helm show values loft-sh/vcluster"
+          fi
+          echo ""
+        fi
+
+        # Check what resources were created before failure
+        echo "  Checking resources in namespace $ns..."
+        echo "  Pods:"
+        kubectl get pods -n "$ns" 2>/dev/null | sed 's/^/    /' || echo "    (none or error)"
+        echo "  Services:"
+        kubectl get services -n "$ns" 2>/dev/null | sed 's/^/    /' || echo "    (none or error)"
+        echo "  Deployments:"
+        kubectl get deployments -n "$ns" 2>/dev/null | sed 's/^/    /' || echo "    (none or error)"
+        echo "  StatefulSets:"
+        kubectl get statefulsets -n "$ns" 2>/dev/null | sed 's/^/    /' || echo "    (none or error)"
+        echo ""
+
+        # Check for common issues
+        echo "  Diagnostic Information:"
+        echo "  - Namespace status:"
+        local ns_phase=$(kubectl get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown")
+        echo "    $ns_phase"
+        if [ "$ns_phase" != "Active" ] && [ "$ns_phase" != "unknown" ]; then
+          echo "    ⚠ Namespace is not in Active state!"
+        fi
+        echo "  - Cluster connectivity:"
+        if kubectl cluster-info &>/dev/null; then
+          echo "    ✓ Cluster is reachable"
+        else
+          echo "    ✗ Cannot reach cluster"
+        fi
+        echo "  - vcluster command:"
+        local vc_version=$(vcluster version --short 2>/dev/null || echo "unknown")
+        echo "    $(which vcluster) version: $vc_version"
+        echo "  - RBAC check (can create pods in namespace):"
+        if kubectl auth can-i create pods -n "$ns" &>/dev/null; then
+          echo "    ✓ Has permission to create pods"
+        else
+          echo "    ✗ No permission to create pods (RBAC issue?)"
+        fi
+        echo "  - Helm check:"
+        if command -v helm &>/dev/null; then
+          echo "    ✓ Helm is installed: $(helm version --short 2>/dev/null || echo 'unknown')"
+        else
+          echo "    ⚠ Helm is not installed (vcluster uses Helm internally)"
+        fi
+        echo ""
+
+        echo "  → Attempting cleanup due to error..."
+
+        # Try to delete vcluster first (might be in partial state)
+        echo "  → Deleting partial vcluster $vc_name..."
+        DELETE_ERROR=$(vcluster delete "$vc_name" -n "$ns" 2>&1)
+        if [ $? -ne 0 ]; then
+          echo "  ⚠ vcluster delete had issues:"
+          echo "$DELETE_ERROR" | sed 's/^/    /'
+        fi
+        sleep 2
+        rm -f "$VCLUSTER_ERROR_LOG"
+
+        # Ask before deleting namespace
+        echo ""
+        echo "  ⚠ vcluster creation failed. Clean up namespace $ns?"
+        read -p "  Delete namespace $ns? (y/N): " confirm
+        confirm=${confirm:-N}
+
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+          echo "  → Deleting namespace $ns..."
+          if kubectl delete namespace "$ns" --wait=false &>/dev/null; then
+            echo "  ✓ Namespace $ns marked for deletion"
+            # Wait a bit for deletion to start
+            sleep 1
+          else
+            echo "  ✗ Failed to delete namespace $ns"
+            echo ""
+            echo "  Manual cleanup required. Run:"
+            echo "    kubectl delete namespace $ns"
+            CLEANUP_COMMANDS+=("kubectl delete namespace $ns")
+          fi
+        else
+          echo "  → Keeping namespace $ns"
+          echo "  To clean up later, run:"
+          echo "    kubectl delete namespace $ns"
+          CLEANUP_COMMANDS+=("kubectl delete namespace $ns")
+        fi
       fi
-      
+
       if (( i % 5 == 0 )); then
         wait
         echo "  Progress: $i/$COUNT clusters processed..."
       fi
     done
-    
+
     wait
-    
+
     end_time=$(date +%s)
     total_time=$((end_time - start_time))
-    
+
     echo ""
     echo "════════════════════════════════════════════════════════════════"
     echo "Summary:"
     echo "  Created: $created"
     echo "  Failed:  $failed"
+    echo "  Skipped: $skipped"
     echo "  Time:    ${total_time}s"
     echo "════════════════════════════════════════════════════════════════"
+
+    # Show cleanup commands if any (deduplicate)
+    local cleanup_count=${#CLEANUP_COMMANDS[@]}
+    if [ "$cleanup_count" -gt 0 ]; then
+      echo ""
+      echo "════════════════════════════════════════════════════════════════"
+      echo "Manual Cleanup Required:"
+      echo "The following namespaces need manual cleanup:"
+      echo ""
+      # Deduplicate cleanup commands
+      declare -A seen_commands
+      local unique_commands=()
+      for cmd in "${CLEANUP_COMMANDS[@]}"; do
+        if [ -z "${seen_commands[$cmd]:-}" ]; then
+          seen_commands[$cmd]=1
+          unique_commands+=("$cmd")
+          echo "  $cmd"
+        fi
+      done
+      echo ""
+      if [ ${#unique_commands[@]} -gt 1 ]; then
+        echo "Or run all at once:"
+        printf "  %s\n" "${unique_commands[@]}"
+      fi
+      echo "════════════════════════════════════════════════════════════════"
+    fi
 }
 
 cmd_verify() {
     local NAMESPACE_PREFIX="${1:-$DEFAULT_PREFIX}"
-    
+
     check_vcluster
-    
+
     echo "════════════════════════════════════════════════════════════════"
     echo "Verifying virtual clusters with prefix: $NAMESPACE_PREFIX"
     echo "════════════════════════════════════════════════════════════════"
-    
+
     vcluster list
 }
 
 cmd_cleanup() {
     local NAMESPACE_PREFIX="${1:-$DEFAULT_PREFIX}"
     local DELETE_KIND="${2:-false}"
-    
+
     check_vcluster
     check_kubectl
-    
-    # Switch to the kind cluster if it exists
-    if kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
-        kubectl config use-context "kind-${KIND_CLUSTER_NAME}" 2>/dev/null || true
-    fi
-    
+
+    # Ensure cluster context is set
+    ensure_cluster
+
     echo "════════════════════════════════════════════════════════════════"
     echo "Cleaning up virtual clusters with prefix: $NAMESPACE_PREFIX"
     echo "════════════════════════════════════════════════════════════════"
-    
+
     vclusters=$(vcluster list --output json 2>/dev/null | jq -r '.[].Name' || echo "")
-    
+
     if [ -z "$vclusters" ]; then
         echo "No virtual clusters found"
     else
         deleted=0
         failed=0
-        
+
         for vc in $vclusters; do
           ns=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$vc\") | .Namespace" || echo "")
           if [[ "$ns" == "${NAMESPACE_PREFIX}-"* ]]; then
@@ -189,13 +721,13 @@ cmd_cleanup() {
             fi
           fi
         done
-        
+
         echo ""
         echo "Summary:"
         echo "  Deleted: $deleted"
         echo "  Failed:  $failed"
     fi
-    
+
     # Optionally delete the kind cluster
     if [ "$DELETE_KIND" = "true" ] || [ "$DELETE_KIND" = "yes" ]; then
         echo ""
@@ -210,27 +742,19 @@ cmd_cleanup() {
 
 cmd_list() {
     check_vcluster
-    
-    # Switch to the kind cluster if it exists
-    if kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
-        kubectl config use-context "kind-${KIND_CLUSTER_NAME}" 2>/dev/null || true
-    fi
-    
+    check_kubectl
+
+    # Ensure cluster context is set
+    ensure_cluster
+
+    local current_ctx=$(get_current_context)
+    local cluster_display="${current_ctx:-$KIND_CLUSTER_NAME}"
+
     echo "════════════════════════════════════════════════════════════════"
     echo "Virtual Clusters:"
-    echo "Host Cluster: $KIND_CLUSTER_NAME"
+    echo "Host Cluster: $cluster_display"
     echo "════════════════════════════════════════════════════════════════"
-    
-    # Check if kubectl can connect first (this might be why it hangs)
-    if ! kubectl cluster-info &>/dev/null; then
-        echo "Warning: Cannot connect to Kubernetes cluster."
-        echo "vcluster list may hang if the API server is unreachable."
-        echo ""
-        echo "Run setup first: $0 setup"
-        echo ""
-        return 1
-    fi
-    
+
     # Try JSON output first (usually faster and more reliable)
     if command -v jq &>/dev/null; then
         JSON_OUTPUT=$(vcluster list --output json 2>&1)
@@ -242,7 +766,7 @@ cmd_list() {
             return 0
         fi
     fi
-    
+
     # Fallback to table output
     vcluster list --output table 2>&1
 }
@@ -253,10 +777,10 @@ run_vcluster_kubectl() {
     local VC_NAMESPACE=$2
     local RESOURCE_TYPE=$3
     local NAMESPACE="${4:-}"
-    
+
     # Get kubeconfig from vcluster using --print flag
     TEMP_KUBECONFIG=$(mktemp)
-    
+
     # Extract kubeconfig from vcluster connect --print output
     # vcluster connect --print outputs the kubeconfig to stdout
     if ! vcluster connect "$VC_NAME" -n "$VC_NAMESPACE" --print 2>/dev/null | grep -A 1000 "^apiVersion:" > "$TEMP_KUBECONFIG"; then
@@ -264,31 +788,31 @@ run_vcluster_kubectl() {
         rm -f "$TEMP_KUBECONFIG"
         return 1
     fi
-    
+
     # Check if we got valid kubeconfig
     if [ ! -s "$TEMP_KUBECONFIG" ] || ! grep -q "^apiVersion:" "$TEMP_KUBECONFIG"; then
         echo "ERROR: Invalid kubeconfig for vcluster: $VC_NAME"
         rm -f "$TEMP_KUBECONFIG"
         return 1
     fi
-    
+
     # Run kubectl command
     if [ -n "$NAMESPACE" ]; then
         kubectl --kubeconfig "$TEMP_KUBECONFIG" get "$RESOURCE_TYPE" -n "$NAMESPACE" 2>/dev/null || echo "No resources found in $NAMESPACE namespace."
     else
         kubectl --kubeconfig "$TEMP_KUBECONFIG" get "$RESOURCE_TYPE" --all-namespaces 2>/dev/null || echo "No resources found."
     fi
-    
+
     rm -f "$TEMP_KUBECONFIG"
 }
 
 # List namespaces in a vcluster
 cmd_ns() {
     local VC_NAME="${1:-}"
-    
+
     check_vcluster
     check_kubectl
-    
+
     if [ -z "$VC_NAME" ]; then
         echo "ERROR: Usage: $0 ns <vcluster-name>"
         echo ""
@@ -296,19 +820,19 @@ cmd_ns() {
         echo "  $0 ns vc-0001"
         exit 1
     fi
-    
+
     # Get namespace from vcluster name
     VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
-    
+
     if [ -z "$VC_NAMESPACE" ]; then
         echo "ERROR: vcluster not found: $VC_NAME"
         exit 1
     fi
-    
+
     echo "════════════════════════════════════════════════════════════════"
     echo "Listing namespaces in vcluster: $VC_NAME (namespace: $VC_NAMESPACE)"
     echo "════════════════════════════════════════════════════════════════"
-    
+
     run_vcluster_kubectl "$VC_NAME" "$VC_NAMESPACE" "namespaces"
 }
 
@@ -316,10 +840,10 @@ cmd_ns() {
 cmd_pods() {
     local VC_NAME="${1:-}"
     local NAMESPACE="${2:-}"
-    
+
     check_vcluster
     check_kubectl
-    
+
     if [ -z "$VC_NAME" ]; then
         echo "ERROR: Usage: $0 pods <vcluster-name> [namespace]"
         echo ""
@@ -328,15 +852,15 @@ cmd_pods() {
         echo "  $0 pods vc-0001 default   # List pods in specific namespace"
         exit 1
     fi
-    
+
     # Get namespace from vcluster name
     VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
-    
+
     if [ -z "$VC_NAMESPACE" ]; then
         echo "ERROR: vcluster not found: $VC_NAME"
         exit 1
     fi
-    
+
     echo "════════════════════════════════════════════════════════════════"
     if [ -n "$NAMESPACE" ]; then
         echo "Listing pods in vcluster: $VC_NAME (namespace: $NAMESPACE)"
@@ -344,7 +868,7 @@ cmd_pods() {
         echo "Listing pods in vcluster: $VC_NAME (all namespaces)"
     fi
     echo "════════════════════════════════════════════════════════════════"
-    
+
     run_vcluster_kubectl "$VC_NAME" "$VC_NAMESPACE" "pods" "$NAMESPACE"
 }
 
@@ -352,10 +876,10 @@ cmd_pods() {
 cmd_deployment() {
     local VC_NAME="${1:-}"
     local NAMESPACE="${2:-}"
-    
+
     check_vcluster
     check_kubectl
-    
+
     if [ -z "$VC_NAME" ]; then
         echo "ERROR: Usage: $0 deployment <vcluster-name> [namespace]"
         echo ""
@@ -364,15 +888,15 @@ cmd_deployment() {
         echo "  $0 deployment vc-0001 default   # List deployments in specific namespace"
         exit 1
     fi
-    
+
     # Get namespace from vcluster name
     VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
-    
+
     if [ -z "$VC_NAMESPACE" ]; then
         echo "ERROR: vcluster not found: $VC_NAME"
         exit 1
     fi
-    
+
     echo "════════════════════════════════════════════════════════════════"
     if [ -n "$NAMESPACE" ]; then
         echo "Listing deployments in vcluster: $VC_NAME (namespace: $NAMESPACE)"
@@ -380,7 +904,7 @@ cmd_deployment() {
         echo "Listing deployments in vcluster: $VC_NAME (all namespaces)"
     fi
     echo "════════════════════════════════════════════════════════════════"
-    
+
     run_vcluster_kubectl "$VC_NAME" "$VC_NAMESPACE" "deployments" "$NAMESPACE"
 }
 
@@ -388,10 +912,10 @@ cmd_deployment() {
 cmd_service() {
     local VC_NAME="${1:-}"
     local NAMESPACE="${2:-}"
-    
+
     check_vcluster
     check_kubectl
-    
+
     if [ -z "$VC_NAME" ]; then
         echo "ERROR: Usage: $0 service <vcluster-name> [namespace]"
         echo ""
@@ -400,15 +924,15 @@ cmd_service() {
         echo "  $0 service vc-0001 default   # List services in specific namespace"
         exit 1
     fi
-    
+
     # Get namespace from vcluster name
     VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
-    
+
     if [ -z "$VC_NAMESPACE" ]; then
         echo "ERROR: vcluster not found: $VC_NAME"
         exit 1
     fi
-    
+
     echo "════════════════════════════════════════════════════════════════"
     if [ -n "$NAMESPACE" ]; then
         echo "Listing services in vcluster: $VC_NAME (namespace: $NAMESPACE)"
@@ -416,24 +940,258 @@ cmd_service() {
         echo "Listing services in vcluster: $VC_NAME (all namespaces)"
     fi
     echo "════════════════════════════════════════════════════════════════"
-    
+
     run_vcluster_kubectl "$VC_NAME" "$VC_NAMESPACE" "services" "$NAMESPACE"
+}
+
+# Get kubeconfig for a vcluster
+cmd_kubeconfig() {
+    local VC_NAME="${1:-}"
+    local OUTPUT_FILE="${2:-}"
+    local MERGE="${3:-false}"
+
+    check_vcluster
+    check_kubectl
+
+    if [ -z "$VC_NAME" ]; then
+        echo "ERROR: Usage: $0 kubeconfig <vcluster-name> [output-file] [merge]"
+        echo ""
+        echo "Get kubeconfig for a vcluster. Options:"
+        echo "  VC_NAME:      vcluster name (e.g., vc-0001)"
+        echo "  OUTPUT_FILE:  Optional file to save kubeconfig (default: print to stdout)"
+        echo "  MERGE:        Set to 'true' to merge into ~/.kube/config (default: false)"
+        echo ""
+        echo "Examples:"
+        echo "  $0 kubeconfig vc-0001                    # Print kubeconfig to stdout"
+        echo "  $0 kubeconfig vc-0001 vc-0001.yaml      # Save to file"
+        echo "  $0 kubeconfig vc-0001 '' true           # Merge into ~/.kube/config"
+        exit 1
+    fi
+
+    # For kubeconfig, we need to be on the HOST cluster, not the vcluster
+    # Save current context
+    local original_context=$(get_current_context)
+    local host_context=""
+
+    # If we're on a vcluster context, extract the host cluster context from it
+    # vcluster context format: vcluster_<vc-name>_<namespace>_<host-context>
+    if echo "$original_context" | grep -q "^vcluster_"; then
+        echo "  ⚠ Currently on vcluster context: $original_context"
+        echo "  → Extracting host cluster context..."
+
+        # Extract host context from vcluster context name
+        # Format: vcluster_<vc-name>_<namespace>_<host-context>
+        # The host context is everything after the third underscore
+        host_context=$(echo "$original_context" | sed 's/^vcluster_[^_]*_[^_]*_//')
+
+        if [ -n "$host_context" ]; then
+            echo "  → Switching to host cluster context: $host_context"
+            if kubectl config use-context "$host_context" 2>/dev/null; then
+                echo "  ✓ Switched to host cluster context"
+            else
+                echo "  ✗ Failed to switch to host cluster context: $host_context"
+                echo ""
+                echo "  Please switch to your host cluster context manually:"
+                echo "    kubectl config use-context <host-cluster-context>"
+                echo ""
+                echo "  Or use --context flag:"
+                echo "    $0 --context <host-context> kubeconfig $VC_NAME"
+                exit 1
+            fi
+        else
+            echo "  ✗ Could not extract host cluster context from: $original_context"
+            echo ""
+            echo "  Please switch to your host cluster context manually:"
+            echo "    kubectl config use-context <host-cluster-context>"
+            exit 1
+        fi
+    else
+        # We're already on a host cluster context, just verify connectivity
+        if ! kubectl cluster-info &>/dev/null; then
+            echo "ERROR: Cannot connect to current cluster context: $original_context"
+            echo "Please check your KUBECONFIG and cluster connectivity"
+            exit 1
+        fi
+        echo "Using current kubectl context: $original_context"
+    fi
+
+    # Get namespace from vcluster name
+    VC_NAMESPACE=$(vcluster list --output json 2>/dev/null | jq -r ".[] | select(.Name==\"$VC_NAME\") | .Namespace" || echo "")
+
+    if [ -z "$VC_NAMESPACE" ]; then
+        echo "ERROR: vcluster not found: $VC_NAME"
+        echo ""
+        echo "Available vclusters:"
+        vcluster list --output table 2>/dev/null || echo "  (run '$0 list' to see vclusters)"
+        # Restore original context if we switched
+        if [ -n "$host_context" ] && [ -n "$original_context" ]; then
+            kubectl config use-context "$original_context" 2>/dev/null || true
+        fi
+        exit 1
+    fi
+
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Getting kubeconfig for vcluster: $VC_NAME (namespace: $VC_NAMESPACE)"
+    echo "════════════════════════════════════════════════════════════════"
+
+    # Get kubeconfig from vcluster
+    TEMP_KUBECONFIG=$(mktemp)
+
+    if ! vcluster connect "$VC_NAME" -n "$VC_NAMESPACE" --print 2>/dev/null | grep -A 1000 "^apiVersion:" > "$TEMP_KUBECONFIG"; then
+        echo "ERROR: Could not get kubeconfig for vcluster: $VC_NAME"
+        rm -f "$TEMP_KUBECONFIG"
+        exit 1
+    fi
+
+    # Check if we got valid kubeconfig
+    if [ ! -s "$TEMP_KUBECONFIG" ] || ! grep -q "^apiVersion:" "$TEMP_KUBECONFIG"; then
+        echo "ERROR: Invalid kubeconfig for vcluster: $VC_NAME"
+        rm -f "$TEMP_KUBECONFIG"
+        exit 1
+    fi
+
+    # Handle merge option
+    if [ "$MERGE" = "true" ] || [ "$MERGE" = "yes" ]; then
+        local KUBECONFIG_FILE="${KUBECONFIG:-$HOME/.kube/config}"
+        local KUBECONFIG_DIR=$(dirname "$KUBECONFIG_FILE")
+
+        # Create .kube directory if it doesn't exist
+        if [ ! -d "$KUBECONFIG_DIR" ]; then
+            mkdir -p "$KUBECONFIG_DIR"
+        fi
+
+        # Backup existing config if it exists
+        if [ -f "$KUBECONFIG_FILE" ]; then
+            cp "$KUBECONFIG_FILE" "${KUBECONFIG_FILE}.backup.$(date +%Y%m%d%H%M%S)"
+        fi
+
+        # Extract context name from kubeconfig
+        CONTEXT_NAME=$(kubectl --kubeconfig "$TEMP_KUBECONFIG" config current-context 2>/dev/null || echo "")
+
+        # Merge kubeconfig
+        KUBECONFIG="$KUBECONFIG_FILE:$TEMP_KUBECONFIG" kubectl config view --flatten > "${KUBECONFIG_FILE}.merged" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            mv "${KUBECONFIG_FILE}.merged" "$KUBECONFIG_FILE"
+            echo "✓ Merged kubeconfig into $KUBECONFIG_FILE"
+            echo ""
+            if [ -n "$CONTEXT_NAME" ]; then
+                echo "Context name: $CONTEXT_NAME"
+                echo ""
+                echo "You can now use:"
+                echo "  kubectl --context $CONTEXT_NAME get nodes"
+                echo "  kubectl config use-context $CONTEXT_NAME"
+            else
+                echo "You can now use:"
+                echo "  kubectl config get-contexts  # to see available contexts"
+            fi
+        else
+            echo "ERROR: Failed to merge kubeconfig"
+            rm -f "${KUBECONFIG_FILE}.merged"
+        fi
+    # Handle output file
+    elif [ -n "$OUTPUT_FILE" ]; then
+        # Expand ~ to home directory
+        OUTPUT_FILE="${OUTPUT_FILE/#\~/$HOME}"
+        # Create directory if it doesn't exist
+        local output_dir=$(dirname "$OUTPUT_FILE")
+        if [ ! -d "$output_dir" ]; then
+            mkdir -p "$output_dir"
+        fi
+        cp "$TEMP_KUBECONFIG" "$OUTPUT_FILE"
+        echo "✓ Saved kubeconfig to: $OUTPUT_FILE"
+        echo ""
+        echo "You can now use:"
+        echo "  kubectl --kubeconfig $OUTPUT_FILE get nodes"
+        echo "  export KUBECONFIG=$OUTPUT_FILE"
+    # Print to stdout
+    else
+        cat "$TEMP_KUBECONFIG"
+    fi
+
+    # Restore original context if we switched
+    if [ -n "$host_context" ] && [ -n "$original_context" ]; then
+        kubectl config use-context "$original_context" 2>/dev/null || true
+    fi
+
+    rm -f "$TEMP_KUBECONFIG"
+}
+
+# Connect to a vcluster (alias for kubeconfig with merge)
+cmd_connect() {
+    local VC_NAME="${1:-}"
+
+    if [ -z "$VC_NAME" ]; then
+        echo "ERROR: Usage: $0 connect <vcluster-name>"
+        echo ""
+        echo "Connect to a vcluster by merging its kubeconfig into ~/.kube/config"
+        echo ""
+        echo "Example:"
+        echo "  $0 connect vc-0001"
+        echo "  kubectl config use-context vcluster_vc-0001_<namespace>"
+        exit 1
+    fi
+
+    cmd_kubeconfig "$VC_NAME" "" "true"
 }
 
 cmd_help() {
     cat <<EOF
 vcluster Management
 
-Usage: $0 <command> [options]
+Usage: $0 [--context CONTEXT] [--use-kind] <command> [options]
+
+Options:
+  --context CONTEXT, -c     Kubernetes context to use as vcluster host
+  --use-kind                Force using kind cluster instead of KUBECONFIG
+
+Environment Variables:
+  VCLUSTER_HOST_CONTEXT     Kubernetes context to use as vcluster host
+                            (default: uses current kubectl context or kind cluster)
+  USE_KIND_CLUSTER          Set to 'true' to force using kind cluster
+                            (default: false)
 
 Commands:
-  setup                     Create dedicated kind cluster for vclusters
-                            (Run this first before creating vclusters)
+  setup [USE_KIND]          Ensure cluster is ready for vclusters
+                            USE_KIND: Set to 'true' to create/use kind cluster
+                            (default: uses KUBECONFIG or current context)
+                            Run this first before creating vclusters
 
-  create [COUNT] [PREFIX]   Create virtual clusters
-                            COUNT: Number of clusters (default: 10)
-                            PREFIX: Namespace prefix (default: vcluster)
-                            Note: Automatically creates kind cluster if needed
+  create [OPTIONS]          Create virtual clusters
+
+                            Positional arguments:
+                              COUNT: Number of clusters (default: 10)
+                              PREFIX: Namespace prefix (default: vcluster)
+                              CONTROL_PLANE_REPLICAS: Control plane replicas (optional)
+                              SYNCER_REPLICAS: Syncer replicas (optional)
+                              KUBERNETES_VERSION: Kubernetes version (optional, e.g., v1.28.0)
+
+                            Options:
+                              --count, -c COUNT              Number of clusters
+                              --prefix, -p PREFIX            Namespace prefix
+                              --control-plane-replicas N     Control plane API server replicas
+                              --cp-replicas N                Alias for --control-plane-replicas
+                              --syncer-replicas N            Syncer component replicas
+                              --kubernetes-version VER       Kubernetes version (e.g., v1.28.0, 1.28.0)
+                              --k8s-version VER              Alias for --kubernetes-version
+                              -k VER                         Short alias for --kubernetes-version
+                              --values, -f FILE              Helm values file
+                              --set KEY=VALUE                Custom Helm values (can be used multiple times)
+
+                            Important: vcluster does NOT have separate "worker nodes".
+                            Workloads run in the host cluster's nodes. The components you can
+                            configure are:
+                            - Control Plane: API server replicas (for HA)
+                            - Syncer: Component that syncs resources between virtual and host cluster
+
+                            Examples:
+                              $0 create 10                                    # 10 clusters, default config
+                              $0 create 10 vcluster 1                         # 10 clusters, 1 control plane replica
+                              $0 create 10 vcluster 1 3                       # 10 clusters, 1 CP replica, 3 syncer replicas
+                              $0 create 10 vcluster 1 3 v1.28.0               # 10 clusters, 1 CP, 3 syncer, K8s v1.28.0
+                              $0 create --count 10 --control-plane-replicas 1 --syncer-replicas 3
+                              $0 create --count 10 --kubernetes-version v1.28.0  # With K8s version
+                              $0 create 10 vcluster 1 --set "key=value"        # With custom Helm values
+                              $0 create 10 --values my-values.yaml            # Using values file
 
   verify [PREFIX]           Verify/list clusters
                             PREFIX: Namespace prefix (default: vcluster)
@@ -441,19 +1199,20 @@ Commands:
   cleanup [PREFIX] [DELETE_KIND]  Cleanup clusters
                             PREFIX: Namespace prefix (default: vcluster)
                             DELETE_KIND: Set to 'true' to also delete kind cluster
+                            (only applies if using kind cluster)
 
   list                      List all virtual clusters
 
   ns VC_NAME                List namespaces in a specific vcluster
                             VC_NAME: vcluster name (e.g., vc-0001)
-                            
+
                             Example:
                               $0 ns vc-0001
 
   pods VC_NAME [NS]         List pods in a specific vcluster
                             VC_NAME: vcluster name (e.g., vc-0001)
                             NS: Optional namespace filter
-                            
+
                             Examples:
                               $0 pods vc-0001           # All namespaces
                               $0 pods vc-0001 default   # Specific namespace
@@ -461,7 +1220,7 @@ Commands:
   deployment VC_NAME [NS]   List deployments in a specific vcluster
                             VC_NAME: vcluster name (e.g., vc-0001)
                             NS: Optional namespace filter
-                            
+
                             Examples:
                               $0 deployment vc-0001           # All namespaces
                               $0 deployment vc-0001 default   # Specific namespace
@@ -469,20 +1228,122 @@ Commands:
   service VC_NAME [NS]      List services in a specific vcluster
                             VC_NAME: vcluster name (e.g., vc-0001)
                             NS: Optional namespace filter
-                            
+
                             Examples:
                               $0 service vc-0001           # All namespaces
                               $0 service vc-0001 default   # Specific namespace
 
+  kubeconfig VC_NAME [FILE] [MERGE]  Get kubeconfig for a vcluster
+                            VC_NAME: vcluster name (e.g., vc-0001)
+                            FILE: Optional file to save kubeconfig (default: print)
+                            MERGE: Set to 'true' to merge into ~/.kube/config
+
+                            Examples:
+                              $0 kubeconfig vc-0001                    # Print to stdout
+                              $0 kubeconfig vc-0001 vc-0001.yaml      # Save to file
+                              $0 kubeconfig vc-0001 '' true           # Merge into kubeconfig
+
+  connect VC_NAME           Connect to a vcluster (merge kubeconfig)
+                            VC_NAME: vcluster name (e.g., vc-0001)
+                            Alias for: kubeconfig VC_NAME '' true
+
+                            Example:
+                              $0 connect vc-0001
+                              kubectl config use-context vcluster_vc-0001_<namespace>
+
   help                      Show this help message
+
+Attaching vclusters to NKP:
+  To attach a vcluster created with this script to NKP management cluster:
+
+    # Using nkp-attach script (recommended - auto-detects namespace)
+    ../nutanix-nkp/nkp-attach attach-vcluster vc-0001
+
+    # Or with specific namespace
+    ../nutanix-nkp/nkp-attach attach-vcluster vc-0001 vcluster-0001
+
+    # Or manually get kubeconfig first, then attach
+    $0 kubeconfig vc-0001 /tmp/vc-0001.yaml
+    ../nutanix-nkp/nkp-attach attach vc-0001 /tmp/vc-0001.yaml
+
+Examples:
+  # Use existing cluster from KUBECONFIG
+  export KUBECONFIG=~/.kube/config
+  $0 setup
+  $0 create 10
+
+  # Create vclusters with 1 control plane replica
+  $0 create 10 vcluster 1
+  # With 1 control plane and 3 syncer replicas
+  $0 create 10 vcluster 1 3
+  # Or using named parameters:
+  $0 create --count 10 --control-plane-replicas 1 --syncer-replicas 3
+
+  # Create vclusters with custom Helm values
+  $0 create 10 --control-plane-replicas 1 --set "key=value"
+  $0 create 10 --values my-values.yaml
+
+  # Create vclusters with specific Kubernetes version
+  $0 create 10 --kubernetes-version v1.28.0
+  $0 create 10 vcluster 1 3 v1.28.0  # Positional args: count, prefix, cp-replicas, syncer-replicas, k8s-version
+
+  # Use specific context via command-line flag
+  $0 --context my-cluster-context setup
+  $0 --context my-cluster-context create 10
+
+  # Use specific context via environment variable
+  export VCLUSTER_HOST_CONTEXT=my-cluster-context
+  $0 setup
+  $0 create 10
+
+  # Force using kind cluster
+  $0 --use-kind setup
+  $0 --use-kind create 10
+
+  # Or via environment variable
+  USE_KIND_CLUSTER=true $0 setup
+  $0 create 10
+
+  # Access vclusters - get kubeconfig
+  $0 kubeconfig vc-0001                    # Print kubeconfig
+  $0 kubeconfig vc-0001 vc-0001.yaml       # Save to file
+  $0 connect vc-0001                       # Merge into ~/.kube/config
+  kubectl --context vcluster_vc-0001_<namespace> get nodes
+
+  # Attach vcluster to NKP management cluster
+  ../nutanix-nkp/nkp-attach attach-vcluster vc-0001
+  # Or with specific namespace
+  ../nutanix-nkp/nkp-attach attach-vcluster vc-0001 vcluster-0001
 
 EOF
 }
 
+# Parse command-line arguments for --context flag
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --context|-c)
+            HOST_CLUSTER_CONTEXT="$2"
+            shift 2
+            ;;
+        --use-kind)
+            USE_KIND_CLUSTER="true"
+            shift
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Set positional parameters back
+set -- "${ARGS[@]}"
+
 COMMAND="${1:-help}"
 
 case "$COMMAND" in
-    setup) cmd_setup ;;
+    setup) shift; cmd_setup "$@" ;;
     create) shift; cmd_create "$@" ;;
     verify) shift; cmd_verify "$@" ;;
     cleanup) shift; cmd_cleanup "$@" ;;
@@ -491,6 +1352,8 @@ case "$COMMAND" in
     pods) shift; cmd_pods "$@" ;;
     deployment) shift; cmd_deployment "$@" ;;
     service) shift; cmd_service "$@" ;;
+    kubeconfig) shift; cmd_kubeconfig "$@" ;;
+    connect) shift; cmd_connect "$@" ;;
     help|--help|-h) cmd_help ;;
     *) echo "ERROR: Unknown command: $COMMAND"; cmd_help; exit 1 ;;
 esac

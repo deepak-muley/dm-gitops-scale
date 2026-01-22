@@ -1,0 +1,1060 @@
+#!/bin/bash
+#
+# NKP Cluster Attach Script
+# Usage: ./nkp-attach <cluster-name> [options]
+#
+# Attaches an NKP management cluster to KUBECONFIG using the NKP CLI.
+# Supports attaching clusters from KUBECONFIG env var or specified kubeconfig file.
+
+set -euo pipefail
+
+# NKP CLI path
+NKP_CLI="${NKP_CLI:-/Users/deepak.muley/ws/nkp/nkp}"
+
+# Default kubeconfig location
+DEFAULT_KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+check_nkp() {
+    if [ ! -f "$NKP_CLI" ] && ! command -v nkp &> /dev/null; then
+        echo "ERROR: NKP CLI not found"
+        echo ""
+        echo "Expected location: $NKP_CLI"
+        echo "Or ensure 'nkp' is in your PATH"
+        echo ""
+        echo "Please set NKP_CLI environment variable if using a different path:"
+        echo "  export NKP_CLI=/path/to/nkp"
+        exit 1
+    fi
+
+    # Use the specified path or 'nkp' from PATH
+    if [ -f "$NKP_CLI" ]; then
+        NKP_CMD="$NKP_CLI"
+    else
+        NKP_CMD="nkp"
+    fi
+}
+
+check_kubectl() {
+    if ! command -v kubectl &> /dev/null; then
+        echo "ERROR: kubectl is not installed"
+        exit 1
+    fi
+}
+
+check_vcluster() {
+    if ! command -v vcluster &> /dev/null; then
+        echo "ERROR: vcluster CLI is not installed"
+        echo ""
+        echo "Install with:"
+        echo "  macOS:   brew install loft-sh/tap/vcluster"
+        echo "  Linux:   curl -L -o vcluster https://github.com/loft-sh/vcluster/releases/latest/download/vcluster-linux-amd64"
+        echo "           chmod +x vcluster && sudo mv vcluster /usr/local/bin/"
+        exit 1
+    fi
+}
+
+check_mgmt_cluster() {
+    local kubeconfig="$1"
+
+    if [ ! -f "$kubeconfig" ]; then
+        echo "ERROR: Kubeconfig file not found: $kubeconfig"
+        exit 1
+    fi
+
+    # Test connectivity to management cluster
+    echo "  → Testing connectivity to management cluster..."
+    if KUBECONFIG="$kubeconfig" kubectl cluster-info &>/dev/null; then
+        echo "  ✓ Management cluster is reachable"
+    else
+        echo "  ⚠ Warning: Cannot verify management cluster connectivity"
+        echo "  → Will proceed anyway (cluster might be accessible via NKP)"
+    fi
+}
+
+# Note: NKP CLI doesn't have a --list flag for attach cluster
+# This function is kept for potential future use or alternative listing methods
+list_clusters() {
+    local kubeconfig="${1:-$DEFAULT_KUBECONFIG}"
+    local mgmt_context="${2:-}"
+
+    echo "  → Listing clusters in management cluster..."
+
+    # Use kubectl to list NKP clusters instead
+    local list_cmd="kubectl get clusters"
+    if [ -n "$kubeconfig" ] && [ "$kubeconfig" != "$DEFAULT_KUBECONFIG" ]; then
+        list_cmd="$list_cmd --kubeconfig $kubeconfig"
+    fi
+    if [ -n "$mgmt_context" ]; then
+        list_cmd="$list_cmd --context $mgmt_context"
+    fi
+
+    eval "$list_cmd" 2>&1 || {
+        echo "  ⚠ Could not list clusters (this is optional)"
+        echo "  → You can manually check: kubectl get clusters"
+    }
+}
+
+# ============================================================================
+# MAIN COMMANDS
+# ============================================================================
+
+cmd_attach() {
+    local CLUSTER_NAME="${1:-}"
+    local CLUSTER_KUBECONFIG="${2:-}"
+    local MGMT_KUBECONFIG="${3:-}"
+    local MGMT_CONTEXT="${4:-}"
+    local WORKSPACE="${5:-}"
+
+    if [ -z "$CLUSTER_NAME" ] || [ -z "$CLUSTER_KUBECONFIG" ]; then
+        echo "ERROR: Cluster name and cluster kubeconfig are required"
+        echo ""
+        echo "Usage: $0 attach <cluster-name> <cluster-kubeconfig> [mgmt-kubeconfig] [mgmt-context] [workspace]"
+        echo ""
+        echo "Arguments:"
+        echo "  cluster-name        Name to give the attached cluster (required)"
+        echo "  cluster-kubeconfig  Path to the kubeconfig file of the cluster to attach (required)"
+        echo "  mgmt-kubeconfig     Path to management cluster kubeconfig (optional)"
+        echo "                      Default: \$KUBECONFIG or ~/.kube/config"
+        echo "  mgmt-context        Kubernetes context for management cluster (optional)"
+        echo "  workspace           NKP workspace name (optional)"
+        echo ""
+        echo "Environment Variables:"
+        echo "  KUBECONFIG          Management cluster kubeconfig path"
+        echo "  NKP_CLI             Path to NKP CLI (default: /Users/deepak.muley/ws/nkp/nkp)"
+        echo ""
+        echo "Examples:"
+        echo "  # Attach cluster using default management kubeconfig"
+        echo "  $0 attach my-cluster ~/.kube/cluster-config.yaml"
+        echo ""
+        echo "  # Attach cluster using specific management kubeconfig"
+        echo "  $0 attach my-cluster ~/.kube/cluster-config.yaml ~/.kube/mgmt-config"
+        echo ""
+        echo "  # Attach cluster with workspace"
+        echo "  $0 attach my-cluster ~/.kube/cluster-config.yaml '' '' my-workspace"
+        echo ""
+        exit 1
+    fi
+
+    check_nkp
+    check_kubectl
+
+    # Verify cluster kubeconfig exists
+    if [ ! -f "$CLUSTER_KUBECONFIG" ]; then
+        echo "ERROR: Cluster kubeconfig file not found: $CLUSTER_KUBECONFIG"
+        exit 1
+    fi
+
+    # Verify cluster kubeconfig is valid
+    echo "  → Verifying cluster kubeconfig..."
+    if KUBECONFIG="$CLUSTER_KUBECONFIG" kubectl cluster-info &>/dev/null; then
+        echo "  ✓ Cluster kubeconfig is valid and cluster is reachable"
+    else
+        echo "  ⚠ Warning: Cannot verify cluster connectivity"
+        echo "  → Will proceed anyway (cluster might be accessible via NKP)"
+    fi
+
+    # Determine management cluster kubeconfig
+    if [ -z "$MGMT_KUBECONFIG" ]; then
+        MGMT_KUBECONFIG="$DEFAULT_KUBECONFIG"
+    fi
+
+    # Check management cluster
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Attaching NKP Cluster: $CLUSTER_NAME"
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  Cluster Name:         $CLUSTER_NAME"
+    echo "  Cluster Kubeconfig:   $CLUSTER_KUBECONFIG"
+    echo "  Management Kubeconfig: $MGMT_KUBECONFIG"
+    if [ -n "$MGMT_CONTEXT" ]; then
+        echo "  Management Context:   $MGMT_CONTEXT"
+    fi
+    if [ -n "$WORKSPACE" ]; then
+        echo "  Workspace:           $WORKSPACE"
+    fi
+    echo ""
+
+    # Build NKP attach command
+    local attach_cmd="$NKP_CMD attach cluster"
+    attach_cmd="$attach_cmd -n $CLUSTER_NAME"
+    attach_cmd="$attach_cmd --attached-kubeconfig $CLUSTER_KUBECONFIG"
+
+    if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+        attach_cmd="$attach_cmd --kubeconfig $MGMT_KUBECONFIG"
+    fi
+
+    if [ -n "$MGMT_CONTEXT" ]; then
+        attach_cmd="$attach_cmd --context $MGMT_CONTEXT"
+    fi
+
+    if [ -n "$WORKSPACE" ]; then
+        attach_cmd="$attach_cmd -w $WORKSPACE"
+    fi
+
+    echo "  → Running: $NKP_CMD attach cluster -n $CLUSTER_NAME --attached-kubeconfig $CLUSTER_KUBECONFIG"
+    if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+        echo "    --kubeconfig $MGMT_KUBECONFIG"
+    fi
+    if [ -n "$MGMT_CONTEXT" ]; then
+        echo "    --context $MGMT_CONTEXT"
+    fi
+    if [ -n "$WORKSPACE" ]; then
+        echo "    -w $WORKSPACE"
+    fi
+    echo ""
+
+    # Run attach command
+    if eval "$attach_cmd" 2>&1; then
+        echo ""
+        echo "  ✓ Cluster '$CLUSTER_NAME' attached successfully to NKP"
+        echo ""
+        echo "  The cluster is now available in your NKP management cluster."
+        echo "  You can access it using:"
+        echo "    kubectl --kubeconfig $MGMT_KUBECONFIG get clusters"
+        echo ""
+    else
+        echo ""
+        echo "  ✗ Failed to attach cluster"
+        echo ""
+        echo "  Troubleshooting:"
+        echo "  - Verify cluster kubeconfig is correct and accessible"
+        echo "  - Check management cluster connectivity"
+        echo "  - Ensure you have permissions to attach clusters"
+        echo "  - Verify workspace name if specified"
+        exit 1
+    fi
+}
+
+cmd_attach_vcluster() {
+    local VCLUSTER_NAME=""
+    local VCLUSTER_NAMESPACE=""
+    local ATTACH_NAME=""
+    local MGMT_KUBECONFIG=""
+    local MGMT_CONTEXT=""
+    local WORKSPACE=""
+
+    # Parse arguments - support both positional and named parameters
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --workspace|-w)
+                WORKSPACE="$2"
+                shift 2
+                ;;
+            --namespace|-n)
+                VCLUSTER_NAMESPACE="$2"
+                shift 2
+                ;;
+            --attach-name|-a)
+                ATTACH_NAME="$2"
+                shift 2
+                ;;
+            --mgmt-kubeconfig|--kubeconfig)
+                MGMT_KUBECONFIG="$2"
+                shift 2
+                ;;
+            --mgmt-context|--context)
+                MGMT_CONTEXT="$2"
+                shift 2
+                ;;
+            --*)
+                echo "ERROR: Unknown option: $1"
+                echo "Use --help to see available options"
+                exit 1
+                ;;
+            *)
+                # Positional arguments
+                if [ -z "$VCLUSTER_NAME" ]; then
+                    VCLUSTER_NAME="$1"
+                elif [ -z "$VCLUSTER_NAMESPACE" ]; then
+                    VCLUSTER_NAMESPACE="$1"
+                elif [ -z "$ATTACH_NAME" ]; then
+                    ATTACH_NAME="$1"
+                elif [ -z "$MGMT_KUBECONFIG" ]; then
+                    MGMT_KUBECONFIG="$1"
+                elif [ -z "$MGMT_CONTEXT" ]; then
+                    MGMT_CONTEXT="$1"
+                elif [ -z "$WORKSPACE" ]; then
+                    WORKSPACE="$1"
+                else
+                    echo "ERROR: Too many arguments"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$VCLUSTER_NAME" ]; then
+        echo "ERROR: vcluster name is required"
+        echo ""
+        echo "Usage: $0 attach-vcluster <vcluster-name> [options]"
+        echo ""
+        echo "Arguments:"
+        echo "  vcluster-name       Name of the vcluster (required)"
+        echo ""
+        echo "Options:"
+        echo "  --workspace, -w NAME     NKP workspace name (required)"
+        echo "  --namespace, -n NS        Namespace where vcluster is running (optional, auto-detected)"
+        echo "  --attach-name, -a NAME   Name to give the attached cluster in NKP (optional)"
+        echo "                          Default: same as vcluster-name"
+        echo "  --mgmt-kubeconfig FILE   Management cluster kubeconfig (optional)"
+        echo "  --mgmt-context CTX       Management cluster context (optional)"
+        echo ""
+        echo "Examples:"
+        echo "  # Attach vcluster with workspace (auto-detect namespace)"
+        echo "  $0 attach-vcluster vc-0001 --workspace my-workspace"
+        echo ""
+        echo "  # Attach vcluster with specific namespace and workspace"
+        echo "  $0 attach-vcluster vc-0001 --namespace vcluster-0001 --workspace my-workspace"
+        echo ""
+        echo "  # Attach vcluster with custom name and workspace"
+        echo "  $0 attach-vcluster vc-0001 --attach-name my-cluster --workspace my-workspace"
+        echo ""
+        exit 1
+    fi
+
+    # Workspace is required
+    if [ -z "$WORKSPACE" ]; then
+        echo "ERROR: Workspace name is required"
+        echo ""
+        echo "Please provide a workspace name using --workspace or -w:"
+        echo "  $0 attach-vcluster $VCLUSTER_NAME --workspace <workspace-name>"
+        echo ""
+        echo "To list available workspaces:"
+        echo "  $0 workspace list"
+        echo ""
+        echo "To create a new workspace:"
+        echo "  $0 workspace create <workspace-name>"
+        echo ""
+        exit 1
+    fi
+
+    check_nkp
+    check_kubectl
+    check_vcluster
+
+    # Determine attach name
+    if [ -z "$ATTACH_NAME" ]; then
+        ATTACH_NAME="$VCLUSTER_NAME"
+    fi
+
+    # Auto-detect namespace if not provided
+    if [ -z "$VCLUSTER_NAMESPACE" ]; then
+        echo "  → Auto-detecting vcluster namespace..."
+
+        # Try JSON output first if jq is available
+        if command -v jq &>/dev/null; then
+            VCLUSTER_NAMESPACE=$(vcluster list --output json 2>/dev/null | \
+                jq -r ".[] | select(.Name==\"$VCLUSTER_NAME\") | .Namespace" 2>/dev/null || echo "")
+        fi
+
+        # Fallback to table output if JSON didn't work
+        if [ -z "$VCLUSTER_NAMESPACE" ]; then
+            VCLUSTER_NAMESPACE=$(vcluster list 2>/dev/null | grep -w "$VCLUSTER_NAME" | awk '{print $2}' | head -1 || echo "")
+        fi
+
+        if [ -z "$VCLUSTER_NAMESPACE" ] || [ "$VCLUSTER_NAMESPACE" = "|" ] || [ "$VCLUSTER_NAMESPACE" = "NAMESPACE" ]; then
+            echo "  ✗ Could not auto-detect namespace for vcluster: $VCLUSTER_NAME"
+            echo ""
+            echo "  Please provide the namespace:"
+            echo "    $0 attach-vcluster $VCLUSTER_NAME <namespace>"
+            echo ""
+            echo "  Or list vclusters to find it:"
+            echo "    vcluster list"
+            exit 1
+        fi
+        echo "  ✓ Found namespace: $VCLUSTER_NAMESPACE"
+    fi
+
+    # Determine management cluster kubeconfig
+    if [ -z "$MGMT_KUBECONFIG" ]; then
+        MGMT_KUBECONFIG="$DEFAULT_KUBECONFIG"
+    fi
+
+    # Check management cluster
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+
+    # Check if workspace exists, create if it doesn't
+    echo "  → Checking if workspace '$WORKSPACE' exists..."
+    local workspace_exists=false
+
+    # Build command to check workspace
+    local check_cmd="$NKP_CMD get workspaces"
+    if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+        check_cmd="$check_cmd --kubeconfig $MGMT_KUBECONFIG"
+    fi
+    if [ -n "$MGMT_CONTEXT" ]; then
+        check_cmd="$check_cmd --context $MGMT_CONTEXT"
+    fi
+
+    # Check if workspace exists - try multiple methods
+    set +e  # Temporarily disable exit on error for workspace check
+    local workspace_output=$(eval "$check_cmd" 2>/dev/null)
+    local check_exit_code=$?
+    set -e  # Re-enable exit on error
+
+    if [ $check_exit_code -eq 0 ] && [ -n "$workspace_output" ]; then
+        # Try to find workspace in output (handle different formats)
+        if echo "$workspace_output" | grep -qE "^$WORKSPACE\s|^$WORKSPACE$|\s$WORKSPACE\s|\s$WORKSPACE$"; then
+            workspace_exists=true
+        elif echo "$workspace_output" | awk '{print $1}' | grep -q "^$WORKSPACE$"; then
+            workspace_exists=true
+        fi
+    fi
+
+    if [ "$workspace_exists" = "true" ]; then
+        echo "  ✓ Workspace '$WORKSPACE' already exists - will use it"
+    else
+        echo "  → Workspace '$WORKSPACE' does not exist, creating it..."
+
+        # Build create workspace command
+        local create_cmd="$NKP_CMD create workspace $WORKSPACE"
+        create_cmd="$create_cmd -n $WORKSPACE"  # Use workspace name as namespace
+
+        if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+            create_cmd="$create_cmd --kubeconfig $MGMT_KUBECONFIG"
+        fi
+
+        if [ -n "$MGMT_CONTEXT" ]; then
+            create_cmd="$create_cmd --context $MGMT_CONTEXT"
+        fi
+
+        set +e  # Temporarily disable exit on error for workspace creation
+        local create_output=$(eval "$create_cmd" 2>&1)
+        local create_exit_code=$?
+        set -e  # Re-enable exit on error
+
+        if [ $create_exit_code -eq 0 ]; then
+            echo "  ✓ Workspace '$WORKSPACE' created successfully"
+        else
+            # Check if workspace was created despite error (race condition)
+            set +e
+            local verify_output=$(eval "$check_cmd" 2>/dev/null)
+            set -e
+            if echo "$verify_output" | grep -qE "^$WORKSPACE\s|^$WORKSPACE$|\s$WORKSPACE\s|\s$WORKSPACE$" || \
+               echo "$verify_output" | awk '{print $1}' | grep -q "^$WORKSPACE$"; then
+                echo "  ✓ Workspace '$WORKSPACE' exists (may have been created by another process)"
+            else
+                echo "  ✗ Failed to create workspace '$WORKSPACE'"
+                echo "  Error output: $create_output"
+                echo ""
+                echo "  Troubleshooting:"
+                echo "  - Verify management cluster connectivity"
+                echo "  - Check if workspace name is valid"
+                echo "  - Ensure you have permissions to create workspaces"
+                echo "  - Try creating manually: $0 workspace create $WORKSPACE"
+                exit 1
+            fi
+        fi
+    fi
+    echo ""
+
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Attaching vcluster to NKP"
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  vcluster Name:        $VCLUSTER_NAME"
+    echo "  vcluster Namespace:   $VCLUSTER_NAMESPACE"
+    echo "  Attach Name:          $ATTACH_NAME"
+    echo "  Workspace:            $WORKSPACE"
+    echo "  Management Kubeconfig: $MGMT_KUBECONFIG"
+    if [ -n "$MGMT_CONTEXT" ]; then
+        echo "  Management Context:   $MGMT_CONTEXT"
+    fi
+    echo ""
+
+    # Get vcluster kubeconfig
+    echo "  → Getting vcluster kubeconfig..."
+    TEMP_KUBECONFIG=$(mktemp)
+    # Also create a named file for debugging (optional, can be cleaned up)
+    DEBUG_KUBECONFIG="${TMPDIR:-/tmp}/vcluster-${VCLUSTER_NAME}-kubeconfig.yaml"
+
+    # Extract kubeconfig from vcluster connect --print output
+    if ! vcluster connect "$VCLUSTER_NAME" -n "$VCLUSTER_NAMESPACE" --print 2>/dev/null | \
+         grep -A 1000 "^apiVersion:" > "$TEMP_KUBECONFIG"; then
+        echo "  ✗ Failed to get kubeconfig for vcluster: $VCLUSTER_NAME"
+        echo ""
+        echo "  Troubleshooting:"
+        echo "  - Verify vcluster exists: vcluster list"
+        echo "  - Check vcluster is running: kubectl get pods -n $VCLUSTER_NAMESPACE"
+        echo "  - Verify namespace is correct"
+        rm -f "$TEMP_KUBECONFIG"
+        exit 1
+    fi
+
+    # Check if we got valid kubeconfig
+    if [ ! -s "$TEMP_KUBECONFIG" ] || ! grep -q "^apiVersion:" "$TEMP_KUBECONFIG"; then
+        echo "  ✗ Invalid kubeconfig for vcluster: $VCLUSTER_NAME"
+        rm -f "$TEMP_KUBECONFIG"
+        exit 1
+    fi
+
+    # Fix kubeconfig: Replace localhost with actual vcluster service endpoint
+    # The webhook needs to reach the cluster from within the cluster, not via localhost
+    echo "  → Fixing kubeconfig to use service endpoint instead of localhost..."
+
+    # Get the vcluster service endpoint
+    # Note: The certificate may not include the full FQDN, so we try shorter names first
+    local vcluster_service_endpoint=""
+
+    # Try to get the service endpoint from the host cluster
+    set +e  # Temporarily disable exit on error
+
+    # Get the service port (usually 443 for HTTPS)
+    local service_port=$(kubectl get svc -n "$VCLUSTER_NAMESPACE" "$VCLUSTER_NAME" -o jsonpath='{.spec.ports[?(@.name=="https" || @.port==443)].port}' 2>/dev/null)
+    if [ -z "$service_port" ]; then
+        # Try to get any port
+        service_port=$(kubectl get svc -n "$VCLUSTER_NAMESPACE" "$VCLUSTER_NAME" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null)
+    fi
+    if [ -z "$service_port" ]; then
+        service_port="443"  # Default to 443
+    fi
+
+    # Use the full FQDN for proper DNS resolution from any namespace
+    # The certificate may not include the full FQDN, so we'll add insecure-skip-tls-verify
+    # This is acceptable for internal cluster communication
+    local cluster_domain="cluster.local"
+    # Try to detect cluster domain (using grep without -P for macOS compatibility)
+    local detected_domain=$(kubectl get configmap -n kube-system coredns -o jsonpath='{.data.Corefile}' 2>/dev/null | grep -oE 'kubernetes[[:space:]]+[^[:space:]]+' | awk '{print $2}' | head -1 || echo "")
+    if [ -n "$detected_domain" ] && [ "$detected_domain" != "kubernetes" ]; then
+        cluster_domain="$detected_domain"
+    fi
+
+    # Use full FQDN for proper DNS resolution: <vcluster-name>.<namespace>.svc.<cluster-domain>
+    local service_fqdn="${VCLUSTER_NAME}.${VCLUSTER_NAMESPACE}.svc.${cluster_domain}"
+    vcluster_service_endpoint="https://${service_fqdn}:${service_port}"
+
+    set -e  # Re-enable exit on error
+
+    echo "  → Using service endpoint: $vcluster_service_endpoint"
+    echo "     (Service FQDN: $service_fqdn, Port: $service_port)"
+    echo "     Note: Certificate may not match FQDN, will add insecure-skip-tls-verify"
+
+    # Replace localhost URLs in kubeconfig with service endpoint
+    # This handles both http://127.0.0.1:PORT and https://127.0.0.1:PORT
+    if command -v sed &>/dev/null; then
+        sed -i.bak "s|server:.*127\.0\.0\.1:[0-9]*|server: $vcluster_service_endpoint|g" "$TEMP_KUBECONFIG" 2>/dev/null || \
+        sed -i '' "s|server:.*127\.0\.0\.1:[0-9]*|server: $vcluster_service_endpoint|g" "$TEMP_KUBECONFIG" 2>/dev/null || true
+        rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
+    else
+        # Fallback if sed is not available
+        perl -i -pe "s|server:.*127\.0\.0\.1:[0-9]*|server: $vcluster_service_endpoint|g" "$TEMP_KUBECONFIG" 2>/dev/null || true
+    fi
+
+    # Also replace any localhost references
+    if command -v sed &>/dev/null; then
+        sed -i.bak "s|https://127\.0\.0\.1:[0-9]*|$vcluster_service_endpoint|g" "$TEMP_KUBECONFIG" 2>/dev/null || \
+        sed -i '' "s|https://127\.0\.0\.1:[0-9]*|$vcluster_service_endpoint|g" "$TEMP_KUBECONFIG" 2>/dev/null || true
+        rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
+    else
+        perl -i -pe "s|https://127\.0\.0\.1:[0-9]*|$vcluster_service_endpoint|g" "$TEMP_KUBECONFIG" 2>/dev/null || true
+    fi
+
+    # Add insecure-skip-tls-verify to handle certificate name mismatch
+    # The certificate is valid for shorter names (vc-0001, vc-0001.vcluster-0001)
+    # but not the full FQDN (vc-0001.vcluster-0001.svc.cluster.local)
+    # IMPORTANT: NKP doesn't allow insecure-skip-tls-verify with certificate-authority-data
+    # So we need to remove the CA data when using insecure mode
+    echo "  → Adding insecure-skip-tls-verify to handle certificate mismatch..."
+    echo "     Note: Removing certificate-authority-data (NKP requirement)"
+
+    if command -v yq &>/dev/null; then
+        # Use yq if available (more reliable for YAML manipulation)
+        yq eval '.clusters[0].cluster."insecure-skip-tls-verify" = true' -i "$TEMP_KUBECONFIG" 2>/dev/null || true
+        yq eval 'del(.clusters[0].cluster."certificate-authority-data")' -i "$TEMP_KUBECONFIG" 2>/dev/null || true
+    elif command -v python3 &>/dev/null; then
+        # Use python to add insecure-skip-tls-verify and remove CA data
+        python3 <<EOF 2>/dev/null || true
+import yaml
+import sys
+
+try:
+    with open("$TEMP_KUBECONFIG", 'r') as f:
+        config = yaml.safe_load(f)
+
+    if 'clusters' in config and len(config['clusters']) > 0:
+        if 'cluster' not in config['clusters'][0]:
+            config['clusters'][0]['cluster'] = {}
+        config['clusters'][0]['cluster']['insecure-skip-tls-verify'] = True
+        # Remove certificate-authority-data if present (NKP doesn't allow both)
+        if 'certificate-authority-data' in config['clusters'][0]['cluster']:
+            del config['clusters'][0]['cluster']['certificate-authority-data']
+
+        with open("$TEMP_KUBECONFIG", 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+except Exception:
+    pass
+EOF
+    else
+        # Fallback: use sed to add insecure-skip-tls-verify and remove CA data
+        if ! grep -q "insecure-skip-tls-verify" "$TEMP_KUBECONFIG" 2>/dev/null; then
+            if command -v sed &>/dev/null; then
+                # Remove certificate-authority-data line first
+                sed -i.bak '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || \
+                sed -i '' '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || true
+                # Add insecure-skip-tls-verify after server line
+                sed -i.bak '/server:/a\
+    insecure-skip-tls-verify: true' "$TEMP_KUBECONFIG" 2>/dev/null || \
+                sed -i '' '/server:/a\
+    insecure-skip-tls-verify: true' "$TEMP_KUBECONFIG" 2>/dev/null || true
+                rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
+            fi
+        else
+            # If insecure-skip-tls-verify already exists, just remove CA data
+            sed -i.bak '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || \
+            sed -i '' '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || true
+            rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
+        fi
+    fi
+
+    # Copy to debug location for manual inspection if needed
+    cp "$TEMP_KUBECONFIG" "$DEBUG_KUBECONFIG" 2>/dev/null || true
+
+    echo "  ✓ Got vcluster kubeconfig"
+    echo "  ✓ Updated kubeconfig to use service endpoint (accessible from webhook pods)"
+    echo "  ✓ Added insecure-skip-tls-verify to handle certificate name mismatch"
+    echo "  ✓ Removed certificate-authority-data (required when using insecure-skip-tls-verify)"
+    echo "  → Saved kubeconfig to: $DEBUG_KUBECONFIG (for debugging)"
+    echo ""
+
+    # Verify the kubeconfig was updated correctly
+    if grep -q "127.0.0.1" "$TEMP_KUBECONFIG" 2>/dev/null; then
+        echo "  ⚠ Warning: kubeconfig still contains localhost references"
+        echo "     This may cause webhook validation to fail"
+        echo "     Please check the kubeconfig manually: $DEBUG_KUBECONFIG"
+    fi
+
+    if ! grep -q "insecure-skip-tls-verify" "$TEMP_KUBECONFIG" 2>/dev/null; then
+        echo "  ⚠ Warning: Could not add insecure-skip-tls-verify to kubeconfig"
+        echo "     You may need to add it manually if certificate validation fails"
+        echo "     Add this to the cluster section: insecure-skip-tls-verify: true"
+        echo "     And remove certificate-authority-data if present"
+    fi
+
+    # Verify CA data was removed
+    if grep -q "certificate-authority-data" "$TEMP_KUBECONFIG" 2>/dev/null; then
+        echo "  ⚠ Warning: kubeconfig still contains certificate-authority-data"
+        echo "     NKP doesn't allow this with insecure-skip-tls-verify"
+        echo "     Attempting to remove it..."
+        if command -v yq &>/dev/null; then
+            yq eval 'del(.clusters[0].cluster."certificate-authority-data")' -i "$TEMP_KUBECONFIG" 2>/dev/null || true
+        elif command -v sed &>/dev/null; then
+            sed -i.bak '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || \
+            sed -i '' '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || true
+            rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
+        fi
+    fi
+    echo ""
+
+    # Now attach using the kubeconfig
+    echo "  → Attaching vcluster to NKP..."
+
+    # Build NKP attach command
+    local attach_cmd="$NKP_CMD attach cluster"
+    attach_cmd="$attach_cmd -n $ATTACH_NAME"
+    attach_cmd="$attach_cmd --attached-kubeconfig $TEMP_KUBECONFIG"
+
+    if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+        attach_cmd="$attach_cmd --kubeconfig $MGMT_KUBECONFIG"
+    fi
+
+    if [ -n "$MGMT_CONTEXT" ]; then
+        attach_cmd="$attach_cmd --context $MGMT_CONTEXT"
+    fi
+
+    # Workspace is required - add it to the command
+    attach_cmd="$attach_cmd -w $WORKSPACE"
+
+    # Print the EXACT command that will be executed
+    echo "  ════════════════════════════════════════════════════════════"
+    echo "  Exact command to run (for manual execution if needed):"
+    echo "  ════════════════════════════════════════════════════════════"
+    echo ""
+    echo "  $attach_cmd"
+    echo ""
+    echo "  Or using the saved kubeconfig file:"
+    echo ""
+    local manual_cmd="$NKP_CMD attach cluster"
+    manual_cmd="$manual_cmd -n $ATTACH_NAME"
+    manual_cmd="$manual_cmd --attached-kubeconfig $DEBUG_KUBECONFIG"
+    if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+        manual_cmd="$manual_cmd --kubeconfig $MGMT_KUBECONFIG"
+    fi
+    if [ -n "$MGMT_CONTEXT" ]; then
+        manual_cmd="$manual_cmd --context $MGMT_CONTEXT"
+    fi
+    manual_cmd="$manual_cmd -w $WORKSPACE"
+    echo "  $manual_cmd"
+    echo ""
+    echo "  ════════════════════════════════════════════════════════════"
+    echo ""
+
+    # Run attach command
+    local attach_success=false
+    if eval "$attach_cmd" 2>&1; then
+        attach_success=true
+    fi
+
+    # Clean up temp kubeconfig (but keep debug copy for troubleshooting)
+    rm -f "$TEMP_KUBECONFIG"
+
+    if [ "$attach_success" = "true" ]; then
+        echo ""
+        echo "  ✓ vcluster '$VCLUSTER_NAME' attached to NKP as '$ATTACH_NAME' in workspace '$WORKSPACE'"
+        echo ""
+        echo "  The vcluster is now available in your NKP management cluster."
+        echo "  You can verify with:"
+        echo "    kubectl --kubeconfig $MGMT_KUBECONFIG get clusters"
+        echo ""
+        # Clean up debug kubeconfig on success
+        rm -f "$DEBUG_KUBECONFIG" 2>/dev/null || true
+    else
+        echo ""
+        echo "  ✗ Failed to attach vcluster to NKP"
+        echo ""
+        echo "  ════════════════════════════════════════════════════════════"
+        echo "  Troubleshooting:"
+        echo "  ════════════════════════════════════════════════════════════"
+        echo ""
+        echo "  1. Verify management cluster connectivity:"
+        echo "     kubectl --kubeconfig $MGMT_KUBECONFIG cluster-info"
+        echo ""
+        echo "  2. Check vcluster is running and accessible:"
+        echo "     kubectl get pods -n $VCLUSTER_NAMESPACE"
+        echo "     vcluster list"
+        echo ""
+        echo "  3. Verify workspace exists:"
+        echo "     $0 workspace list"
+        echo ""
+        echo "  4. Test vcluster kubeconfig manually:"
+        echo "     kubectl --kubeconfig $DEBUG_KUBECONFIG cluster-info"
+        echo ""
+        echo "  5. Try running the exact command manually (see above)"
+        echo ""
+        echo "  6. Kubeconfig saved for debugging: $DEBUG_KUBECONFIG"
+        echo "     (You can inspect it or use it to retry the attach command)"
+        echo ""
+        echo "  ════════════════════════════════════════════════════════════"
+        exit 1
+    fi
+}
+
+cmd_workspace_create() {
+    local WORKSPACE_NAME="${1:-}"
+    local WORKSPACE_NAMESPACE="${2:-}"
+    local MGMT_KUBECONFIG="${3:-}"
+    local MGMT_CONTEXT="${4:-}"
+
+    if [ -z "$WORKSPACE_NAME" ]; then
+        echo "ERROR: Workspace name is required"
+        echo ""
+        echo "Usage: $0 workspace create <workspace-name> [namespace] [mgmt-kubeconfig] [mgmt-context]"
+        echo ""
+        echo "Arguments:"
+        echo "  workspace-name      Name of the workspace to create (required)"
+        echo "  namespace           Namespace to create for the workspace (optional)"
+        echo "                     Default: same as workspace-name"
+        echo "  mgmt-kubeconfig     Management cluster kubeconfig (optional)"
+        echo "  mgmt-context        Management cluster context (optional)"
+        echo ""
+        echo "Examples:"
+        echo "  # Create workspace with default namespace"
+        echo "  $0 workspace create my-workspace"
+        echo ""
+        echo "  # Create workspace with specific namespace"
+        echo "  $0 workspace create my-workspace my-namespace"
+        echo ""
+        exit 1
+    fi
+
+    check_nkp
+    check_kubectl
+
+    # Determine namespace
+    if [ -z "$WORKSPACE_NAMESPACE" ]; then
+        WORKSPACE_NAMESPACE="$WORKSPACE_NAME"
+    fi
+
+    # Determine management cluster kubeconfig
+    if [ -z "$MGMT_KUBECONFIG" ]; then
+        MGMT_KUBECONFIG="$DEFAULT_KUBECONFIG"
+    fi
+
+    # Check management cluster
+    check_mgmt_cluster "$MGMT_KUBECONFIG"
+
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Creating NKP Workspace"
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  Workspace Name:       $WORKSPACE_NAME"
+    echo "  Namespace:            $WORKSPACE_NAMESPACE"
+    echo "  Management Kubeconfig: $MGMT_KUBECONFIG"
+    if [ -n "$MGMT_CONTEXT" ]; then
+        echo "  Management Context:   $MGMT_CONTEXT"
+    fi
+    echo ""
+
+    # Build NKP create workspace command
+    local create_cmd="$NKP_CMD create workspace $WORKSPACE_NAME"
+    create_cmd="$create_cmd -n $WORKSPACE_NAMESPACE"
+
+    if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+        create_cmd="$create_cmd --kubeconfig $MGMT_KUBECONFIG"
+    fi
+
+    if [ -n "$MGMT_CONTEXT" ]; then
+        create_cmd="$create_cmd --context $MGMT_CONTEXT"
+    fi
+
+    echo "  → Creating workspace..."
+    if eval "$create_cmd" 2>&1; then
+        echo ""
+        echo "  ✓ Workspace '$WORKSPACE_NAME' created successfully"
+        echo ""
+        echo "  You can now use this workspace when attaching clusters:"
+        echo "    $0 attach-vcluster <vcluster-name> --workspace $WORKSPACE_NAME"
+    else
+        echo ""
+        echo "  ✗ Failed to create workspace"
+        echo ""
+        echo "  Troubleshooting:"
+        echo "  - Verify management cluster connectivity"
+        echo "  - Check if workspace already exists: $0 workspace list"
+        echo "  - Ensure you have permissions to create workspaces"
+        exit 1
+    fi
+}
+
+cmd_workspace_list() {
+    local MGMT_KUBECONFIG="${1:-$DEFAULT_KUBECONFIG}"
+    local MGMT_CONTEXT="${2:-}"
+
+    check_nkp
+
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Listing NKP Workspaces"
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  Management Kubeconfig: $MGMT_KUBECONFIG"
+    if [ -n "$MGMT_CONTEXT" ]; then
+        echo "  Management Context:   $MGMT_CONTEXT"
+    fi
+    echo ""
+
+    local list_cmd="$NKP_CMD get workspaces"
+    if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+        list_cmd="$list_cmd --kubeconfig $MGMT_KUBECONFIG"
+    fi
+    if [ -n "$MGMT_CONTEXT" ]; then
+        list_cmd="$list_cmd --context $MGMT_CONTEXT"
+    fi
+
+    eval "$list_cmd" 2>&1 || {
+        echo "  ✗ Failed to list workspaces"
+        echo ""
+        echo "  Troubleshooting:"
+        echo "  - Check management cluster connectivity"
+        echo "  - Verify NKP CLI is working: $NKP_CMD version"
+        exit 1
+    }
+}
+
+cmd_list() {
+    local MGMT_KUBECONFIG="${1:-$DEFAULT_KUBECONFIG}"
+    local MGMT_CONTEXT="${2:-}"
+
+    check_nkp
+
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Listing Available NKP Clusters"
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  Management Kubeconfig: $MGMT_KUBECONFIG"
+    if [ -n "$MGMT_CONTEXT" ]; then
+        echo "  Management Context:   $MGMT_CONTEXT"
+    fi
+    echo ""
+
+    local list_cmd="$NKP_CMD attach cluster --list"
+    if [ -n "$MGMT_KUBECONFIG" ] && [ "$MGMT_KUBECONFIG" != "$DEFAULT_KUBECONFIG" ]; then
+        list_cmd="$list_cmd --kubeconfig $MGMT_KUBECONFIG"
+    fi
+    if [ -n "$MGMT_CONTEXT" ]; then
+        list_cmd="$list_cmd --context $MGMT_CONTEXT"
+    fi
+
+    eval "$list_cmd" 2>&1 || {
+        echo "  ✗ Failed to list clusters"
+        echo ""
+        echo "  Troubleshooting:"
+        echo "  - Check management cluster connectivity"
+        echo "  - Verify NKP CLI is working: $NKP_CMD version"
+        exit 1
+    }
+}
+
+cmd_help() {
+    cat <<EOF
+NKP Cluster Attach
+
+Attaches NKP management clusters to KUBECONFIG using the NKP CLI.
+
+Usage: $0 <command> [options]
+
+Commands:
+  attach <cluster-name> <cluster-kubeconfig> [mgmt-kubeconfig] [mgmt-context] [workspace]
+                            Attach an NKP cluster to the management cluster
+
+                            Arguments:
+                              cluster-name        Name to give the attached cluster (required)
+                              cluster-kubeconfig  Path to kubeconfig of cluster to attach (required)
+                              mgmt-kubeconfig     Management cluster kubeconfig path (optional)
+                                                  Default: \$KUBECONFIG or ~/.kube/config
+                              mgmt-context        Management cluster context (optional)
+                              workspace           NKP workspace name (optional)
+
+                            Examples:
+                              $0 attach my-cluster ~/.kube/cluster-config.yaml
+                              $0 attach my-cluster ~/.kube/cluster-config.yaml ~/.kube/mgmt-config
+                              $0 attach my-cluster ~/.kube/cluster-config.yaml '' '' my-workspace
+
+  attach-vcluster <vcluster-name> [options]
+                            Attach a vcluster (created with vcluster-cluster) to NKP
+
+                            Automatically gets the vcluster kubeconfig and attaches it.
+
+                            Arguments:
+                              vcluster-name       Name of the vcluster (required)
+
+                            Options:
+                              --workspace, -w NAME     NKP workspace name (required)
+                              --namespace, -n NS       Namespace where vcluster runs (optional, auto-detected)
+                              --attach-name, -a NAME   Name in NKP (optional, defaults to vcluster-name)
+                              --mgmt-kubeconfig FILE   Management cluster kubeconfig (optional)
+                              --mgmt-context CTX       Management cluster context (optional)
+
+                            Examples:
+                              $0 attach-vcluster vc-0001 --workspace my-workspace
+                              $0 attach-vcluster vc-0001 --workspace my-workspace --namespace vcluster-0001
+                              $0 attach-vcluster vc-0001 -w my-workspace -a my-vcluster
+
+  workspace create <workspace-name> [namespace] [mgmt-kubeconfig] [mgmt-context]
+                            Create a new NKP workspace
+
+                            Arguments:
+                              workspace-name      Name of the workspace (required)
+                              namespace           Namespace for the workspace (optional, defaults to workspace-name)
+                              mgmt-kubeconfig     Management cluster kubeconfig (optional)
+                              mgmt-context        Management cluster context (optional)
+
+                            Examples:
+                              $0 workspace create my-workspace
+                              $0 workspace create my-workspace my-namespace
+
+  workspace list [mgmt-kubeconfig] [mgmt-context]
+                            List all NKP workspaces
+
+                            Examples:
+                              $0 workspace list
+                              $0 workspace list ~/.kube/mgmt-config
+
+  list [mgmt-kubeconfig] [mgmt-context]
+                            List attached NKP clusters in management cluster
+
+                            Examples:
+                              $0 list
+                              $0 list ~/.kube/mgmt-config my-context
+
+  help                      Show this help message
+
+Environment Variables:
+  KUBECONFIG                Management cluster kubeconfig path
+  NKP_CLI                   Path to NKP CLI (default: /Users/deepak.muley/ws/nkp/nkp)
+
+Examples:
+  # Attach cluster using default management kubeconfig
+  $0 attach dm-nkp-mgmt-1 ~/.kube/dm-nkp-mgmt-1-config.yaml
+
+  # Attach cluster using specific management kubeconfig
+  $0 attach dm-nkp-mgmt-1 ~/.kube/dm-nkp-mgmt-1-config.yaml ~/.kube/mgmt-config
+
+  # Attach vcluster (auto-detects namespace)
+  $0 attach-vcluster vc-0001
+
+  # Attach vcluster with specific namespace
+  $0 attach-vcluster vc-0001 vcluster-0001
+
+  # Attach vcluster with custom name in NKP
+  $0 attach-vcluster vc-0001 vcluster-0001 my-vcluster-name
+
+  # Attach vcluster with workspace
+  $0 attach-vcluster vc-0001 vcluster-0001 vc-0001 '' '' my-workspace
+
+  # List attached clusters
+  $0 list
+  $0 list ~/.kube/mgmt-config
+
+EOF
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+COMMAND="${1:-help}"
+
+case "$COMMAND" in
+    attach)
+        shift
+        cmd_attach "$@"
+        ;;
+    attach-vcluster)
+        shift
+        cmd_attach_vcluster "$@"
+        ;;
+    workspace)
+        shift
+        WORKSPACE_SUBCOMMAND="${1:-}"
+        shift || true
+        case "$WORKSPACE_SUBCOMMAND" in
+            create)
+                cmd_workspace_create "$@"
+                ;;
+            list)
+                cmd_workspace_list "$@"
+                ;;
+            *)
+                echo "ERROR: Unknown workspace command: $WORKSPACE_SUBCOMMAND"
+                echo ""
+                echo "Available workspace commands:"
+                echo "  create    Create a new workspace"
+                echo "  list      List all workspaces"
+                echo ""
+                echo "Examples:"
+                echo "  $0 workspace create my-workspace"
+                echo "  $0 workspace list"
+                exit 1
+                ;;
+        esac
+        ;;
+    list)
+        shift
+        cmd_list "$@"
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        # If no command specified, treat first arg as cluster name
+        if [ -n "$COMMAND" ] && [ "$COMMAND" != "help" ]; then
+            cmd_attach "$COMMAND" "$@"
+        else
+            echo "ERROR: Unknown command: $COMMAND"
+            echo ""
+            cmd_help
+            exit 1
+        fi
+        ;;
+esac
