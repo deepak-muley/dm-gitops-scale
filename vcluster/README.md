@@ -435,10 +435,91 @@ kubectl get pods -n vcluster-0001 | grep syncer
 - **Leader election**: Multiple syncers coordinate automatically
 - **Performance**: More syncers = faster resource synchronization
 
+## Fixing Kubeconfig from KommanderCluster Secrets
+
+When you extract a kubeconfig from a KommanderCluster secret (e.g., from NKP/Nutanix), the kubeconfig contains internal service DNS names like `vc-0001.vcluster-0001.svc.cluster.local` that work **inside the cluster** but don't resolve **outside the cluster**.
+
+### Important: Two Different Use Cases
+
+**Internal Use (kommander-ui pods):**
+- The kubeconfig in the KommanderCluster secret **MUST** keep the service DNS endpoint
+- This is used by pods running inside the cluster (like `kommander-ui`)
+- The service DNS (`vc-0001.vcluster-0001.svc.cluster.local`) resolves correctly from inside the cluster
+- **DO NOT modify the original secret** - it's correct for internal use
+
+**External Use (your local machine):**
+- When extracting the kubeconfig for use outside the cluster, you need a different endpoint
+- The service DNS doesn't resolve from your local machine
+- You need to create a **copy** with `localhost:8443` and use port-forward
+
+### Problem
+
+```bash
+# Extract kubeconfig from secret
+kubectl get secret -n my-workspace attached-l2pjt -o jsonpath='{.data.kubeconfig}' | base64 -d > /tmp/kubeconfig.yaml
+
+# Try to use it from outside cluster - fails with DNS resolution error
+kubectl --kubeconfig /tmp/kubeconfig.yaml get nodes
+# Error: couldn't get current server API group list: Get "https://vc-0001.vcluster-0001.svc.cluster.local:443/api?timeout=32s": dial tcp: lookup vc-0001.vcluster-0001.svc.cluster.local: no such host
+```
+
+### Solution
+
+Use the `fix-kubeconfig` command to create a **copy** for external use:
+
+```bash
+# 1. Extract kubeconfig from secret (original - keep this for reference)
+kubectl get secret -n my-workspace attached-l2pjt -o jsonpath='{.data.kubeconfig}' | base64 -d > /tmp/kubeconfig-original.yaml
+
+# 2. Create a fixed copy for external use (original is NOT modified)
+./vcluster-cluster fix-kubeconfig /tmp/kubeconfig-original.yaml /tmp/kubeconfig-external.yaml
+
+# 3. Set up port-forward to the vcluster service (in a separate terminal)
+#    Replace vcluster-0001 and vc-0001 with your actual namespace and vcluster name
+kubectl port-forward -n vcluster-0001 svc/vc-0001 8443:443
+
+# 4. Use the fixed kubeconfig (while port-forward is running)
+kubectl --kubeconfig /tmp/kubeconfig-external.yaml get nodes
+```
+
+### What the fix does
+
+The `fix-kubeconfig` command creates a **copy** of the kubeconfig for external use:
+1. **Replaces service DNS names** with `localhost:8443` (requires port-forward)
+2. **Adds `insecure-skip-tls-verify`** to handle certificate name mismatches
+3. **Removes `certificate-authority-data`** (required when using insecure mode)
+
+**Important:** The original kubeconfig file is **never modified** - it remains correct for internal use by kommander-ui pods.
+
+### Alternative: Use vcluster connect directly
+
+Instead of extracting from the secret, you can get a working kubeconfig directly:
+
+```bash
+# Get kubeconfig directly from vcluster (recommended)
+./vcluster-cluster kubeconfig vc-0001 /tmp/vc-0001.yaml
+
+# This kubeconfig will work with port-forward or vcluster connect
+vcluster connect vc-0001 -n vcluster-0001
+```
+
+### Troubleshooting
+
+**If port-forward doesn't work:**
+- Verify the vcluster service exists: `kubectl get svc -n vcluster-0001`
+- Check the service name matches: `kubectl get svc -n vcluster-0001 | grep vc-0001`
+- Try a different port: `kubectl port-forward -n vcluster-0001 svc/vc-0001 8444:443`
+
+**If you need to use the service endpoint directly:**
+- You must be inside the cluster (e.g., from a pod)
+- Or use a LoadBalancer/NodePort service type
+- Or use an ingress controller
+
 ## Notes
 
 - Each vcluster runs in its own namespace
 - vclusters are functional Kubernetes clusters that can run workloads
 - Much lighter than real clusters but heavier than KWOK or paused CAPI objects
 - Syncer replicas improve performance and availability, not compute capacity
+- Kubeconfigs extracted from KommanderCluster secrets may need fixing for external use
 

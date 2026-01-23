@@ -1134,6 +1134,215 @@ cmd_connect() {
     cmd_kubeconfig "$VC_NAME" "" "true"
 }
 
+# Fix kubeconfig extracted from KommanderCluster secret
+# This fixes kubeconfigs that have internal service DNS names that don't resolve outside the cluster
+# IMPORTANT: The original kubeconfig in the secret MUST keep the service DNS for internal use (kommander-ui pods)
+# This command creates a COPY for external use only
+cmd_fix_kubeconfig() {
+    local KUBECONFIG_FILE="${1:-}"
+    local OUTPUT_FILE="${2:-}"
+
+    check_kubectl
+
+    if [ -z "$KUBECONFIG_FILE" ]; then
+        echo "ERROR: Usage: $0 fix-kubeconfig <input-kubeconfig> <output-file>"
+        echo ""
+        echo "Fix a kubeconfig extracted from KommanderCluster secret for EXTERNAL use only."
+        echo ""
+        echo "⚠️  IMPORTANT: The original kubeconfig in the KommanderCluster secret MUST keep"
+        echo "   the service DNS endpoint (e.g., vc-0001.vcluster-0001.svc.cluster.local)"
+        echo "   because it's used by pods running INSIDE the cluster (like kommander-ui)."
+        echo "   This command creates a COPY for external use - DO NOT modify the original secret!"
+        echo ""
+        echo "This command will:"
+        echo "  1. Replace internal service DNS names with localhost:8443"
+        echo "  2. Add insecure-skip-tls-verify"
+        echo "  3. Remove certificate-authority-data"
+        echo ""
+        echo "Options:"
+        echo "  KUBECONFIG_FILE:  Path to the kubeconfig file to fix (required)"
+        echo "  OUTPUT_FILE:       Path to save the fixed kubeconfig (REQUIRED - never overwrites input)"
+        echo ""
+        echo "Examples:"
+        echo "  # Extract and fix kubeconfig for external use"
+        echo "  kubectl get secret -n my-workspace attached-l2pjt -o jsonpath='{.data.kubeconfig}' | base64 -d > /tmp/kubeconfig-original.yaml"
+        echo "  $0 fix-kubeconfig /tmp/kubeconfig-original.yaml /tmp/kubeconfig-external.yaml"
+        echo ""
+        echo "  # The original kubeconfig remains unchanged (for internal use by kommander-ui)"
+        echo "  # The fixed kubeconfig is saved to output file (for external use with port-forward)"
+        exit 1
+    fi
+
+    if [ -z "$OUTPUT_FILE" ]; then
+        echo "ERROR: Output file is REQUIRED to prevent accidentally overwriting the original kubeconfig"
+        echo "       The original kubeconfig must keep the service DNS for internal use by kommander-ui pods"
+        echo ""
+        echo "Usage: $0 fix-kubeconfig <input-kubeconfig> <output-file>"
+        exit 1
+    fi
+
+    # Expand ~ to home directory
+    KUBECONFIG_FILE="${KUBECONFIG_FILE/#\~/$HOME}"
+
+    if [ ! -f "$KUBECONFIG_FILE" ]; then
+        echo "ERROR: Kubeconfig file not found: $KUBECONFIG_FILE"
+        exit 1
+    fi
+
+    # Check if it's a valid kubeconfig
+    if ! grep -q "^apiVersion:" "$KUBECONFIG_FILE" 2>/dev/null; then
+        echo "ERROR: Invalid kubeconfig file: $KUBECONFIG_FILE"
+        echo "       File does not appear to be a valid kubeconfig (missing apiVersion)"
+        exit 1
+    fi
+
+    # Output file is required (never overwrite input)
+    OUTPUT_FILE="${OUTPUT_FILE/#\~/$HOME}"
+    # Create directory if it doesn't exist
+    local output_dir=$(dirname "$OUTPUT_FILE")
+    if [ ! -d "$output_dir" ]; then
+        mkdir -p "$output_dir"
+    fi
+
+    # Check if output file is the same as input (prevent overwriting)
+    if [ "$(realpath "$KUBECONFIG_FILE" 2>/dev/null || echo "$KUBECONFIG_FILE")" = "$(realpath "$OUTPUT_FILE" 2>/dev/null || echo "$OUTPUT_FILE")" ]; then
+        echo "ERROR: Output file cannot be the same as input file"
+        echo "       This prevents accidentally overwriting the original kubeconfig"
+        echo "       The original must keep service DNS for internal use by kommander-ui pods"
+        exit 1
+    fi
+
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Fixing kubeconfig for EXTERNAL use"
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  Input:  $KUBECONFIG_FILE (original - will NOT be modified)"
+    echo "  Output: $OUTPUT_FILE (fixed copy for external use)"
+    echo ""
+    echo "⚠️  IMPORTANT: The original kubeconfig in the KommanderCluster secret"
+    echo "   MUST keep the service DNS endpoint for internal use by kommander-ui pods."
+    echo "   This command creates a COPY for external use only."
+    echo "════════════════════════════════════════════════════════════════"
+
+    # Create temporary file
+    TEMP_KUBECONFIG=$(mktemp)
+    cp "$KUBECONFIG_FILE" "$TEMP_KUBECONFIG"
+
+    # Check if kubeconfig has service DNS names that need fixing
+    if ! grep -q "\.svc\.cluster\.local" "$TEMP_KUBECONFIG" 2>/dev/null; then
+        echo "  → No service DNS names found in kubeconfig"
+        echo "  → Kubeconfig may already be fixed or doesn't need fixing"
+    else
+        echo "  → Found service DNS names in kubeconfig"
+        echo "  → Replacing with localhost:8443 (you'll need to set up port-forward)"
+
+        # Replace service DNS names with localhost
+        # Pattern: https://vc-XXXX.vcluster-XXXX.svc.cluster.local:443
+        # Replace with: https://127.0.0.1:8443
+        if command -v sed &>/dev/null; then
+            sed -i.bak 's|server:.*\.svc\.cluster\.local:[0-9]*|server: https://127.0.0.1:8443|g' "$TEMP_KUBECONFIG" 2>/dev/null || \
+            sed -i '' 's|server:.*\.svc\.cluster\.local:[0-9]*|server: https://127.0.0.1:8443|g' "$TEMP_KUBECONFIG" 2>/dev/null || true
+            rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
+        else
+            perl -i -pe 's|server:.*\.svc\.cluster\.local:[0-9]*|server: https://127.0.0.1:8443|g' "$TEMP_KUBECONFIG" 2>/dev/null || true
+        fi
+
+        echo "  ✓ Replaced service DNS names with localhost:8443"
+    fi
+
+    # Add insecure-skip-tls-verify and remove certificate-authority-data
+    echo "  → Adding insecure-skip-tls-verify..."
+
+    if command -v yq &>/dev/null; then
+        # Use yq if available (more reliable for YAML manipulation)
+        yq eval '.clusters[0].cluster."insecure-skip-tls-verify" = true' -i "$TEMP_KUBECONFIG" 2>/dev/null || true
+        yq eval 'del(.clusters[0].cluster."certificate-authority-data")' -i "$TEMP_KUBECONFIG" 2>/dev/null || true
+        echo "  ✓ Added insecure-skip-tls-verify using yq"
+        echo "  ✓ Removed certificate-authority-data"
+    elif command -v python3 &>/dev/null; then
+        # Use python to add insecure-skip-tls-verify and remove CA data
+        python3 <<EOF 2>/dev/null || true
+import yaml
+import sys
+
+try:
+    with open("$TEMP_KUBECONFIG", 'r') as f:
+        config = yaml.safe_load(f)
+
+    if 'clusters' in config and len(config['clusters']) > 0:
+        if 'cluster' not in config['clusters'][0]:
+            config['clusters'][0]['cluster'] = {}
+        config['clusters'][0]['cluster']['insecure-skip-tls-verify'] = True
+        # Remove certificate-authority-data if present
+        if 'certificate-authority-data' in config['clusters'][0]['cluster']:
+            del config['clusters'][0]['cluster']['certificate-authority-data']
+
+        with open("$TEMP_KUBECONFIG", 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+except Exception as e:
+    sys.stderr.write(f"Error: {e}\n")
+    sys.exit(1)
+EOF
+        if [ $? -eq 0 ]; then
+            echo "  ✓ Added insecure-skip-tls-verify using python"
+            echo "  ✓ Removed certificate-authority-data"
+        else
+            echo "  ⚠ Warning: Failed to update kubeconfig with python"
+        fi
+    else
+        # Fallback: use sed to add insecure-skip-tls-verify and remove CA data
+        if ! grep -q "insecure-skip-tls-verify" "$TEMP_KUBECONFIG" 2>/dev/null; then
+            if command -v sed &>/dev/null; then
+                # Remove certificate-authority-data line first
+                sed -i.bak '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || \
+                sed -i '' '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || true
+                # Add insecure-skip-tls-verify after server line
+                sed -i.bak '/server:/a\
+    insecure-skip-tls-verify: true' "$TEMP_KUBECONFIG" 2>/dev/null || \
+                sed -i '' '/server:/a\
+    insecure-skip-tls-verify: true' "$TEMP_KUBECONFIG" 2>/dev/null || true
+                rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
+                echo "  ✓ Added insecure-skip-tls-verify using sed"
+                echo "  ✓ Removed certificate-authority-data"
+            fi
+        else
+            # If insecure-skip-tls-verify already exists, just remove CA data
+            sed -i.bak '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || \
+            sed -i '' '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || true
+            rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
+            echo "  ✓ insecure-skip-tls-verify already present"
+            echo "  ✓ Removed certificate-authority-data"
+        fi
+    fi
+
+    # Copy to output file
+    cp "$TEMP_KUBECONFIG" "$OUTPUT_FILE"
+    rm -f "$TEMP_KUBECONFIG"
+
+    echo ""
+    echo "✓ Kubeconfig fixed and saved to: $OUTPUT_FILE"
+    echo "✓ Original kubeconfig unchanged: $KUBECONFIG_FILE"
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "Usage Instructions"
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
+    echo "For EXTERNAL use (with port-forward):"
+    echo "  1. Set up port-forward to the vcluster service (in a separate terminal):"
+    echo "     kubectl port-forward -n <vcluster-namespace> svc/<vcluster-name> 8443:443"
+    echo ""
+    echo "  2. Use the fixed kubeconfig (while port-forward is running):"
+    echo "     kubectl --kubeconfig $OUTPUT_FILE get nodes"
+    echo "     export KUBECONFIG=$OUTPUT_FILE"
+    echo ""
+    echo "For INTERNAL use (kommander-ui pods):"
+    echo "  The original kubeconfig in the KommanderCluster secret is correct"
+    echo "  and should NOT be modified. It uses the service DNS endpoint"
+    echo "  (e.g., vc-0001.vcluster-0001.svc.cluster.local) which works from"
+    echo "  inside the cluster."
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+}
+
 cmd_help() {
     cat <<EOF
 vcluster Management
@@ -1251,6 +1460,26 @@ Commands:
                               $0 connect vc-0001
                               kubectl config use-context vcluster_vc-0001_<namespace>
 
+  fix-kubeconfig FILE OUTPUT   Fix kubeconfig for EXTERNAL use only
+                            FILE: Path to kubeconfig file to fix (original - not modified)
+                            OUTPUT: Output file for fixed kubeconfig (REQUIRED)
+
+                            ⚠️  IMPORTANT: The original kubeconfig in KommanderCluster secret
+                            MUST keep the service DNS endpoint for internal use by kommander-ui
+                            pods. This command creates a COPY for external use only.
+
+                            This fixes kubeconfigs that have internal service DNS names
+                            that don't resolve outside the cluster. It will:
+                            - Replace service DNS names with localhost:8443
+                            - Add insecure-skip-tls-verify
+                            - Remove certificate-authority-data
+
+                            Example:
+                              kubectl get secret -n my-workspace attached-l2pjt -o jsonpath='{.data.kubeconfig}' | base64 -d > /tmp/kubeconfig-original.yaml
+                              $0 fix-kubeconfig /tmp/kubeconfig-original.yaml /tmp/kubeconfig-external.yaml
+                              kubectl port-forward -n vcluster-0001 svc/vc-0001 8443:443
+                              kubectl --kubeconfig /tmp/kubeconfig-external.yaml get nodes
+
   help                      Show this help message
 
 Attaching vclusters to NKP:
@@ -1354,6 +1583,7 @@ case "$COMMAND" in
     service) shift; cmd_service "$@" ;;
     kubeconfig) shift; cmd_kubeconfig "$@" ;;
     connect) shift; cmd_connect "$@" ;;
+    fix-kubeconfig) shift; cmd_fix_kubeconfig "$@" ;;
     help|--help|-h) cmd_help ;;
     *) echo "ERROR: Unknown command: $COMMAND"; cmd_help; exit 1 ;;
 esac

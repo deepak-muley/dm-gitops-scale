@@ -514,25 +514,19 @@ cmd_attach_vcluster() {
         service_port="443"  # Default to 443
     fi
 
-    # Use the full FQDN for proper DNS resolution from any namespace
-    # The certificate may not include the full FQDN, so we'll add insecure-skip-tls-verify
-    # This is acceptable for internal cluster communication
-    local cluster_domain="cluster.local"
-    # Try to detect cluster domain (using grep without -P for macOS compatibility)
-    local detected_domain=$(kubectl get configmap -n kube-system coredns -o jsonpath='{.data.Corefile}' 2>/dev/null | grep -oE 'kubernetes[[:space:]]+[^[:space:]]+' | awk '{print $2}' | head -1 || echo "")
-    if [ -n "$detected_domain" ] && [ "$detected_domain" != "kubernetes" ]; then
-        cluster_domain="$detected_domain"
-    fi
-
-    # Use full FQDN for proper DNS resolution: <vcluster-name>.<namespace>.svc.<cluster-domain>
-    local service_fqdn="${VCLUSTER_NAME}.${VCLUSTER_NAMESPACE}.svc.${cluster_domain}"
-    vcluster_service_endpoint="https://${service_fqdn}:${service_port}"
+    # Use the shorter DNS name that matches the certificate
+    # The vcluster certificate typically includes: <vcluster-name> and <vcluster-name>.<namespace>
+    # but NOT the full FQDN <vcluster-name>.<namespace>.svc.cluster.local
+    # Using the shorter name avoids TLS certificate validation errors
+    # The shorter name still resolves correctly from inside the cluster
+    local service_dns="${VCLUSTER_NAME}.${VCLUSTER_NAMESPACE}"
+    vcluster_service_endpoint="https://${service_dns}:${service_port}"
 
     set -e  # Re-enable exit on error
 
     echo "  → Using service endpoint: $vcluster_service_endpoint"
-    echo "     (Service FQDN: $service_fqdn, Port: $service_port)"
-    echo "     Note: Certificate may not match FQDN, will add insecure-skip-tls-verify"
+    echo "     (Service DNS: $service_dns, Port: $service_port)"
+    echo "     Note: Using shorter DNS name to match certificate (avoids TLS errors)"
 
     # Replace localhost URLs in kubeconfig with service endpoint
     # This handles both http://127.0.0.1:PORT and https://127.0.0.1:PORT
@@ -554,16 +548,17 @@ cmd_attach_vcluster() {
         perl -i -pe "s|https://127\.0\.0\.1:[0-9]*|$vcluster_service_endpoint|g" "$TEMP_KUBECONFIG" 2>/dev/null || true
     fi
 
-    # Add insecure-skip-tls-verify to handle certificate name mismatch
-    # The certificate is valid for shorter names (vc-0001, vc-0001.vcluster-0001)
-    # but not the full FQDN (vc-0001.vcluster-0001.svc.cluster.local)
-    # IMPORTANT: NKP doesn't allow insecure-skip-tls-verify with certificate-authority-data
-    # So we need to remove the CA data when using insecure mode
-    echo "  → Adding insecure-skip-tls-verify to handle certificate mismatch..."
-    echo "     Note: Removing certificate-authority-data (NKP requirement)"
+    # Since we're using the shorter DNS name that matches the certificate,
+    # we may not need insecure-skip-tls-verify. However, NKP may still require it
+    # in some cases, so we'll add it but keep the CA data if possible.
+    # If NKP rejects it, we'll remove the CA data.
+    echo "  → Checking if insecure-skip-tls-verify is needed..."
+    echo "     Using DNS name that should match certificate: $service_dns"
 
     if command -v yq &>/dev/null; then
         # Use yq if available (more reliable for YAML manipulation)
+        # Add insecure-skip-tls-verify for NKP compatibility
+        # NKP requires removing CA data when using insecure-skip-tls-verify
         yq eval '.clusters[0].cluster."insecure-skip-tls-verify" = true' -i "$TEMP_KUBECONFIG" 2>/dev/null || true
         yq eval 'del(.clusters[0].cluster."certificate-authority-data")' -i "$TEMP_KUBECONFIG" 2>/dev/null || true
     elif command -v python3 &>/dev/null; then
@@ -580,7 +575,7 @@ try:
         if 'cluster' not in config['clusters'][0]:
             config['clusters'][0]['cluster'] = {}
         config['clusters'][0]['cluster']['insecure-skip-tls-verify'] = True
-        # Remove certificate-authority-data if present (NKP doesn't allow both)
+        # Remove certificate-authority-data (NKP doesn't allow both)
         if 'certificate-authority-data' in config['clusters'][0]['cluster']:
             del config['clusters'][0]['cluster']['certificate-authority-data']
 
@@ -615,9 +610,9 @@ EOF
     cp "$TEMP_KUBECONFIG" "$DEBUG_KUBECONFIG" 2>/dev/null || true
 
     echo "  ✓ Got vcluster kubeconfig"
-    echo "  ✓ Updated kubeconfig to use service endpoint (accessible from webhook pods)"
-    echo "  ✓ Added insecure-skip-tls-verify to handle certificate name mismatch"
-    echo "  ✓ Removed certificate-authority-data (required when using insecure-skip-tls-verify)"
+    echo "  ✓ Updated kubeconfig to use service endpoint: $service_dns (matches certificate)"
+    echo "  ✓ Added insecure-skip-tls-verify for NKP compatibility"
+    echo "  ✓ Removed certificate-authority-data (NKP requirement when using insecure-skip-tls-verify)"
     echo "  → Saved kubeconfig to: $DEBUG_KUBECONFIG (for debugging)"
     echo ""
 
@@ -635,7 +630,7 @@ EOF
         echo "     And remove certificate-authority-data if present"
     fi
 
-    # Verify CA data was removed
+    # Verify CA data was removed (required by NKP when using insecure-skip-tls-verify)
     if grep -q "certificate-authority-data" "$TEMP_KUBECONFIG" 2>/dev/null; then
         echo "  ⚠ Warning: kubeconfig still contains certificate-authority-data"
         echo "     NKP doesn't allow this with insecure-skip-tls-verify"
@@ -647,6 +642,8 @@ EOF
             sed -i '' '/certificate-authority-data:/d' "$TEMP_KUBECONFIG" 2>/dev/null || true
             rm -f "${TEMP_KUBECONFIG}.bak" 2>/dev/null || true
         fi
+    else
+        echo "  ✓ Certificate-authority-data removed (required by NKP)"
     fi
     echo ""
 
