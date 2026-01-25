@@ -25,7 +25,7 @@ Then it measures and compares **actual observed differences**.
 
 ```bash
 cd bin-packing
-./bin-packing-comparison.sh
+../bin-packing/bin-packing-comparison.sh
 ```
 
 **What Happens:**
@@ -364,5 +364,5 @@ This is the **only way** to get actual proof of bin packing benefits with real d
 
 **Run it now:**
 ```bash
-./bin-packing-comparison.sh
+../bin-packing/bin-packing-comparison.sh
 ```

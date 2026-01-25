@@ -271,7 +271,7 @@ The comparison scripts now show:
 
 Run:
 ```bash
-./compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
+../bin-packing/compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
 ```
 
 You'll now see a breakdown explaining why there are fewer total pods!

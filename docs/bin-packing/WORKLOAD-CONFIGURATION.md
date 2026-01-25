@@ -266,7 +266,7 @@ kubectl describe deployment test-workload-small --context kind-cluster-default
 ## Modifying Workloads
 
 To modify the workloads, edit the `deploy_workloads()` function in:
-- `bin-packing/bin-packing-comparison.sh`
+- `../bin-packing/bin-packing-comparison.sh`
 
 Changes to consider:
 - Number of replicas per workload

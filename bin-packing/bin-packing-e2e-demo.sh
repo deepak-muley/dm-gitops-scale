@@ -428,7 +428,7 @@ NAME:.metadata.name,CPU:.status.capacity.cpu,MEMORY:.status.capacity.memory
     echo "  How Bin Packing Improves Utilization"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    echo "For detailed explanation, see: BIN-PACKING-UTILIZATION-EXPLAINED.md"
+    echo "For detailed explanation, see: ../docs/bin-packing/BIN-PACKING-UTILIZATION-EXPLAINED.md"
     echo ""
     
     cat <<'EXPLANATION'
@@ -564,7 +564,7 @@ main() {
     echo "  1. Access Grafana to visualize metrics (see access info above)"
     echo "  2. Check Prometheus for detailed metrics"
     echo "  3. Deploy more workloads and observe bin packing behavior"
-    echo "  4. Read BIN-PACKING-UTILIZATION-EXPLAINED.md for detailed analysis"
+    echo "  4. Read ../docs/bin-packing/BIN-PACKING-UTILIZATION-EXPLAINED.md for detailed analysis"
     echo ""
     echo "To delete the cluster later:"
     echo "  kind delete cluster --name $CLUSTER_NAME"

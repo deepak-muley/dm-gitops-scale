@@ -10,7 +10,7 @@ This document explains what happens when you run the bin packing scripts and wha
 Creates a local kind (Kubernetes in Docker) cluster with resource bin packing enabled for demonstration and learning.
 
 **For a complete end-to-end demonstration with Prometheus/Grafana and detailed utilization analysis, see:**
-- **[`bin-packing-e2e-demo.sh`](./bin-packing-e2e-demo.sh)** - Complete E2E demo with metrics and explanations
+- **[`bin-packing-e2e-demo.sh`](../bin-packing/bin-packing-e2e-demo.sh)** - Complete E2E demo with metrics and explanations
 - **[Bin Packing Utilization Explained](./BIN-PACKING-UTILIZATION-EXPLAINED.md)** - Detailed explanation of utilization improvements
 
 ### What It Does

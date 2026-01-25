@@ -193,8 +193,8 @@ kubectl get pods -A --context kind-cluster-bin-packing --field-selector=status.p
 The `cluster-metrics-analyzer.sh` script has been updated to use JSON output, which handles this correctly:
 
 ```bash
-./cluster-metrics-analyzer.sh kind-cluster-default
-./cluster-metrics-analyzer.sh kind-cluster-bin-packing
+../bin-packing/cluster-metrics-analyzer.sh kind-cluster-default
+../bin-packing/cluster-metrics-analyzer.sh kind-cluster-bin-packing
 ```
 
 This will show:

@@ -87,6 +87,6 @@ When creating bin packing configurations for other services:
 
 ## Additional Resources
 
-- [Kubernetes Resource Bin Packing Guide](../docs/bin-packing/K8s-Resource-Bin-Packing-Guide.md)
-- [What to Expect Guide](../WHAT-TO-EXPECT.md)
-- [Troubleshooting Guide](../TROUBLESHOOTING.md)
+- [Kubernetes Resource Bin Packing Guide](../../docs/bin-packing/K8s-Resource-Bin-Packing-Guide.md)
+- [What to Expect Guide](../../docs/bin-packing/WHAT-TO-EXPECT.md)
+- [Troubleshooting Guide](../../docs/bin-packing/TROUBLESHOOTING.md)

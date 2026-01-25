@@ -385,7 +385,7 @@ kubectl get pods --all-namespaces --context my-cluster -o json | \
 For side-by-side comparison of two clusters, use the comparison script:
 
 ```bash
-./compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
+../bin-packing/compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
 ```
 
 This will show:
@@ -397,8 +397,8 @@ This will show:
 ## Related Scripts
 
 - `compare-clusters.sh` - **Quick side-by-side comparison** of two clusters
-- `bin-packing-comparison.sh` - Creates two clusters and compares them
-- `bin-packing-e2e-demo.sh` - E2E demonstration with Prometheus
+- `../bin-packing/bin-packing-comparison.sh` - Creates two clusters and compares them
+- `../bin-packing/bin-packing-e2e-demo.sh` - E2E demonstration with Prometheus
 - `nkp-platform-bin-packing.sh` - Apply bin packing to NKP clusters
 
 ---

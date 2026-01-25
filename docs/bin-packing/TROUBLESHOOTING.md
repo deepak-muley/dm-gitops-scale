@@ -129,7 +129,7 @@ If the script fails partway through:
 
 3. **Re-run script:**
    ```bash
-   ./bin-packing-kind-setup.sh mostallocated
+   ../bin-packing/bin-packing-kind-setup.sh mostallocated
    ```
 
 ## Alternative: Use Real Kubernetes Cluster

@@ -30,7 +30,7 @@ Sets up a kind cluster with Kubernetes resource bin packing enabled. Demonstrate
 
 **Usage:**
 ```bash
-./bin-packing-kind-setup.sh [strategy]
+../bin-packing/bin-packing-kind-setup.sh [strategy]
 ```
 
 **Strategies:**
@@ -40,10 +40,10 @@ Sets up a kind cluster with Kubernetes resource bin packing enabled. Demonstrate
 **Example:**
 ```bash
 # Use MostAllocated strategy
-./bin-packing-kind-setup.sh mostallocated
+../bin-packing/bin-packing-kind-setup.sh mostallocated
 
 # Use RequestedToCapacityRatio strategy
-./bin-packing-kind-setup.sh requestedtocapacityratio
+../bin-packing/bin-packing-kind-setup.sh requestedtocapacityratio
 ```
 
 **What it does:**
@@ -88,19 +88,21 @@ export KUBECONFIG=/path/to/kubeconfig
 
 **See [cluster-metrics-analyzer-README.md](./cluster-metrics-analyzer-README.md) for details.**
 
+**Script location:** `../bin-packing/cluster-metrics-analyzer.sh`
+
 ### `compare-clusters.sh` 🔄 **Quick Side-by-Side Comparison**
 
 Compares two clusters side-by-side with highlighted differences.
 
 **Usage:**
 ```bash
-./compare-clusters.sh <context1> <context2>
+../bin-packing/compare-clusters.sh <context1> <context2>
 ```
 
 **Examples:**
 ```bash
-./compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
-./compare-clusters.sh production-cluster staging-cluster
+../bin-packing/compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
+../bin-packing/compare-clusters.sh production-cluster staging-cluster
 ```
 
 **What it shows:**
@@ -117,13 +119,13 @@ Identifies which pods could not be scheduled and why.
 
 **Usage:**
 ```bash
-./diagnose-unscheduled-pods.sh <context>
+../bin-packing/diagnose-unscheduled-pods.sh <context>
 ```
 
 **Examples:**
 ```bash
-./diagnose-unscheduled-pods.sh kind-cluster-default
-./diagnose-unscheduled-pods.sh kind-cluster-bin-packing
+../bin-packing/diagnose-unscheduled-pods.sh kind-cluster-default
+../bin-packing/diagnose-unscheduled-pods.sh kind-cluster-bin-packing
 ```
 
 **What it shows:**
@@ -263,7 +265,7 @@ See [Bin Packing Utilization Explained](./BIN-PACKING-UTILIZATION-EXPLAINED.md) 
 
 - **[What to Expect Guide](./WHAT-TO-EXPECT.md)** - Detailed explanation of what happens when you run the scripts and what results to expect
 - **[Bin Packing Utilization Explained](./BIN-PACKING-UTILIZATION-EXPLAINED.md)** - How bin packing improves utilization with examples and metrics
-- [Kubernetes Resource Bin Packing Guide](../docs/bin-packing/K8s-Resource-Bin-Packing-Guide.md) - Complete guide with explanations and examples
+- [Kubernetes Resource Bin Packing Guide](./K8s-Resource-Bin-Packing-Guide.md) - Complete guide with explanations and examples
 - [NKP Platform Applications Guide](../docs/nkp/NKP-Platform-Applications-Guide.md) - NKP platform services overview
 - [Troubleshooting Guide](./TROUBLESHOOTING.md) - Common issues and solutions
 

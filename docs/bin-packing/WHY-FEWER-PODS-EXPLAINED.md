@@ -230,9 +230,9 @@ The comparison scripts now show:
 
 Run:
 ```bash
-./bin-packing-comparison.sh
+../bin-packing/bin-packing-comparison.sh
 # or
-./compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
+../bin-packing/compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
 ```
 
 You'll now see a "Pod Scheduling Status" section explaining the difference!

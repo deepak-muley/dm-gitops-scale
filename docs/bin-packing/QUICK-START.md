@@ -12,7 +12,7 @@ Get started with Kubernetes resource bin packing in minutes!
 
 ```bash
 cd bin-packing
-./bin-packing-comparison.sh
+../bin-packing/bin-packing-comparison.sh
 ```
 
 **What you get:**
@@ -54,7 +54,7 @@ cd bin-packing
 
 ```bash
 cd bin-packing
-./bin-packing-kind-setup.sh mostallocated
+../bin-packing/bin-packing-kind-setup.sh mostallocated
 ```
 
 When prompted, answer:
@@ -77,7 +77,7 @@ When prompted, answer:
 
 ```bash
 cd bin-packing
-./cluster-metrics-analyzer.sh [context]
+../bin-packing/cluster-metrics-analyzer.sh [context]
 ```
 
 **What you get:**
@@ -91,13 +91,13 @@ cd bin-packing
 **Examples:**
 ```bash
 # Analyze kind cluster
-./cluster-metrics-analyzer.sh kind-bin-packing-demo
+../bin-packing/cluster-metrics-analyzer.sh kind-bin-packing-demo
 
 # Analyze production cluster
-./cluster-metrics-analyzer.sh my-production-cluster
+../bin-packing/cluster-metrics-analyzer.sh my-production-cluster
 
 # Current context
-./cluster-metrics-analyzer.sh
+../bin-packing/cluster-metrics-analyzer.sh
 ```
 
 **Time:** ~10-30 seconds (depends on cluster size)
@@ -108,12 +108,12 @@ cd bin-packing
 
 ```bash
 cd bin-packing
-./compare-clusters.sh <context1> <context2>
+../bin-packing/compare-clusters.sh <context1> <context2>
 ```
 
 **Example:**
 ```bash
-./compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
+../bin-packing/compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
 ```
 
 **What you get:**
@@ -347,7 +347,7 @@ kind delete cluster --name bin-packing-demo
 
 - **[Bin Packing Utilization Explained](./BIN-PACKING-UTILIZATION-EXPLAINED.md)** - Detailed explanation with examples
 - **[What to Expect Guide](./WHAT-TO-EXPECT.md)** - Complete guide on what happens
-- **[Kubernetes Resource Bin Packing Guide](../docs/bin-packing/K8s-Resource-Bin-Packing-Guide.md)** - Full technical guide
+- **[Kubernetes Resource Bin Packing Guide](./K8s-Resource-Bin-Packing-Guide.md)** - Full technical guide
 - **[Troubleshooting Guide](./TROUBLESHOOTING.md)** - Common issues and solutions
 
 ---

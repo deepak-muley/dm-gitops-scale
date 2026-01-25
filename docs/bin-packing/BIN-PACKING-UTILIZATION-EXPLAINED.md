@@ -362,7 +362,7 @@ The `bin-packing-comparison.sh` script creates TWO clusters to measure actual di
 The `bin-packing-e2e-demo.sh` script demonstrates bin packing with detailed metrics:
 
 ```bash
-./bin-packing-e2e-demo.sh mostallocated
+../bin-packing/bin-packing-e2e-demo.sh mostallocated
 ```
 
 This will:
@@ -385,5 +385,5 @@ This will:
 
 For more details, see:
 - [What to Expect Guide](./WHAT-TO-EXPECT.md)
-- [Kubernetes Resource Bin Packing Guide](../docs/bin-packing/K8s-Resource-Bin-Packing-Guide.md)
+- [Kubernetes Resource Bin Packing Guide](./K8s-Resource-Bin-Packing-Guide.md)
 - [Troubleshooting Guide](./TROUBLESHOOTING.md)
