@@ -30,7 +30,7 @@ Sets up a kind cluster with Kubernetes resource bin packing enabled. Demonstrate
 
 **Usage:**
 ```bash
-../bin-packing/bin-packing-kind-setup.sh [strategy]
+./bin-packing-kind-setup.sh [strategy]
 ```
 
 **Strategies:**
@@ -40,10 +40,10 @@ Sets up a kind cluster with Kubernetes resource bin packing enabled. Demonstrate
 **Example:**
 ```bash
 # Use MostAllocated strategy
-../bin-packing/bin-packing-kind-setup.sh mostallocated
+./bin-packing-kind-setup.sh mostallocated
 
 # Use RequestedToCapacityRatio strategy
-../bin-packing/bin-packing-kind-setup.sh requestedtocapacityratio
+./bin-packing-kind-setup.sh requestedtocapacityratio
 ```
 
 **What it does:**
@@ -86,9 +86,7 @@ export KUBECONFIG=/path/to/kubeconfig
 ./cluster-metrics-analyzer.sh cluster-context
 ```
 
-**See [cluster-metrics-analyzer-README.md](./cluster-metrics-analyzer-README.md) for details.**
-
-**Script location:** `../bin-packing/cluster-metrics-analyzer.sh`
+**See [cluster-metrics-analyzer-README.md](./docs/bin-packing/cluster-metrics-analyzer-README.md) for details.**
 
 ### `compare-clusters.sh` 🔄 **Quick Side-by-Side Comparison**
 
@@ -96,13 +94,13 @@ Compares two clusters side-by-side with highlighted differences.
 
 **Usage:**
 ```bash
-../bin-packing/compare-clusters.sh <context1> <context2>
+./compare-clusters.sh <context1> <context2>
 ```
 
 **Examples:**
 ```bash
-../bin-packing/compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
-../bin-packing/compare-clusters.sh production-cluster staging-cluster
+./compare-clusters.sh kind-cluster-default kind-cluster-bin-packing
+./compare-clusters.sh production-cluster staging-cluster
 ```
 
 **What it shows:**
@@ -119,13 +117,13 @@ Identifies which pods could not be scheduled and why.
 
 **Usage:**
 ```bash
-../bin-packing/diagnose-unscheduled-pods.sh <context>
+./diagnose-unscheduled-pods.sh <context>
 ```
 
 **Examples:**
 ```bash
-../bin-packing/diagnose-unscheduled-pods.sh kind-cluster-default
-../bin-packing/diagnose-unscheduled-pods.sh kind-cluster-bin-packing
+./diagnose-unscheduled-pods.sh kind-cluster-default
+./diagnose-unscheduled-pods.sh kind-cluster-bin-packing
 ```
 
 **What it shows:**
@@ -234,7 +232,7 @@ Creates TWO clusters side-by-side to compare default scheduler vs bin packing wi
 
 **This is the only way to get actual measured comparison with real applications!**
 
-**See [COMPARISON-GUIDE.md](./COMPARISON-GUIDE.md) for detailed explanation.**
+**See [COMPARISON-GUIDE.md](./docs/bin-packing/COMPARISON-GUIDE.md) for detailed explanation.**
 
 ### `bin-packing-e2e-demo.sh`
 
@@ -263,11 +261,11 @@ See [Bin Packing Utilization Explained](./BIN-PACKING-UTILIZATION-EXPLAINED.md) 
 
 ## Related Documentation
 
-- **[What to Expect Guide](./WHAT-TO-EXPECT.md)** - Detailed explanation of what happens when you run the scripts and what results to expect
-- **[Bin Packing Utilization Explained](./BIN-PACKING-UTILIZATION-EXPLAINED.md)** - How bin packing improves utilization with examples and metrics
-- [Kubernetes Resource Bin Packing Guide](./K8s-Resource-Bin-Packing-Guide.md) - Complete guide with explanations and examples
+- **[What to Expect Guide](./docs/bin-packing/WHAT-TO-EXPECT.md)** - Detailed explanation of what happens when you run the scripts and what results to expect
+- **[Bin Packing Utilization Explained](./docs/bin-packing/BIN-PACKING-UTILIZATION-EXPLAINED.md)** - How bin packing improves utilization with examples and metrics
+- [Kubernetes Resource Bin Packing Guide](./docs/bin-packing/K8s-Resource-Bin-Packing-Guide.md) - Complete guide with explanations and examples
 - [NKP Platform Applications Guide](../docs/nkp/NKP-Platform-Applications-Guide.md) - NKP platform services overview
-- [Troubleshooting Guide](./TROUBLESHOOTING.md) - Common issues and solutions
+- [Troubleshooting Guide](./docs/bin-packing/TROUBLESHOOTING.md) - Common issues and solutions
 
 ## Expected Behavior
 
