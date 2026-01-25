@@ -2,7 +2,7 @@
 
 This guide provides advanced scaling strategies, resource sizing, and actionable steps for scaling Cluster API (CAPI) with Nutanix Kubernetes Platform (NKP) management clusters.
 
-> **Complements:** `CLUSTER-API-SCALING-DEEP-DIVE.md`, `CAPI-SCALING-SOLUTIONS-AND-FIXES.md`, `NKP-Sizing-Scale-Guide.md`
+> **Complements:** `../capi/CLUSTER-API-SCALING-DEEP-DIVE.md`, `../capi/CAPI-SCALING-SOLUTIONS-AND-FIXES.md`, `NKP-Sizing-Scale-Guide.md`
 >
 > **Last Updated:** January 2026
 

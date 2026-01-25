@@ -1,0 +1,196 @@
+# Example: Installing kube-prometheus-stack with Bin Packing
+# 
+# This demonstrates how to configure a platform service (kube-prometheus-stack)
+# to use resource bin packing for better density.
+#
+# Usage:
+#   1. Add Prometheus Helm repo: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   2. Update repo: helm repo update
+#   3. Install with this values file: helm install prometheus prometheus-community/kube-prometheus-stack -n monitoring --create-namespace -f prometheus-bin-packing-example.yaml
+
+# Global configuration
+global:
+  # Note: schedulerName is set per component below
+  # For kind clusters with modified default scheduler: leave empty or omit (uses default with bin packing)
+  # For NKP clusters with platform-services profile: use schedulerName: "platform-services"
+
+# Prometheus Operator
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # Use bin packing scheduler
+  # For kind: leave empty (default scheduler has bin packing)
+  # For NKP: set to "platform-services"
+  schedulerName: ""  # Set to "platform-services" for NKP clusters
+
+# Prometheus Server
+prometheus:
+  prometheusSpec:
+    # Enable bin packing for Prometheus pods
+    # For kind clusters: leave empty (default scheduler has bin packing enabled)
+    # For NKP clusters: set to "platform-services"
+    schedulerName: ""  # Set to "platform-services" for NKP clusters
+    
+    # Resource requests - important for bin packing
+    # Set these based on your cluster size and retention needs
+    resources:
+      requests:
+        cpu: 1000m      # Adjust based on scrape targets
+        memory: 4Gi     # Adjust based on retention
+      limits:
+        cpu: 2000m
+        memory: 8Gi
+    
+    # Retention settings
+    retention: 15d
+    retentionSize: 50GB
+    
+    # Replicas - for HA, use 2+ with anti-affinity
+    replicas: 1
+    
+    # Storage
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+    
+    # Pod anti-affinity (optional - balances HA with bin packing)
+    # Uncomment to spread across nodes for HA
+    # podAntiAffinity: "soft"
+    # affinity:
+    #   podAntiAffinity:
+    #     preferredDuringSchedulingIgnoredDuringExecution:
+    #     - weight: 100
+    #       podAffinityTerm:
+    #         labelSelector:
+    #           matchLabels:
+    #             app.kubernetes.io/name: prometheus
+    #         topologyKey: kubernetes.io/hostname
+
+# Alertmanager
+alertmanager:
+  alertmanagerSpec:
+    # Enable bin packing for Alertmanager
+    # For kind: leave empty (default scheduler has bin packing)
+    # For NKP: set to "platform-services"
+    schedulerName: ""  # Set to "platform-services" for NKP clusters
+    
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    
+    # For HA, use 3 replicas
+    replicas: 1
+    
+    # Storage
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+# Grafana
+grafana:
+  # Enable bin packing for Grafana
+  # For kind: leave empty (default scheduler has bin packing)
+  # For NKP: set to "platform-services"
+  schedulerName: ""  # Set to "platform-services" for NKP clusters
+  
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  
+  # Persistence
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClassName: ""  # Use your storage class
+  
+  # Admin credentials (change in production!)
+  adminUser: admin
+  adminPassword: prom-operator
+
+# Node Exporter (DaemonSet - runs on every node)
+nodeExporter:
+  # DaemonSets run on all nodes, so schedulerName doesn't apply
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# Kube State Metrics
+kubeStateMetrics:
+  # Enable bin packing for kube-state-metrics
+  # For kind: leave empty (default scheduler has bin packing)
+  # For NKP: set to "platform-services"
+  schedulerName: ""  # Set to "platform-services" for NKP clusters
+  
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  
+  replicas: 1
+
+# Prometheus Adapter (for HPA metrics)
+prometheus-adapter:
+  enabled: false  # Disable if not needed
+
+# Additional components
+kubeApiServer:
+  enabled: true
+kubelet:
+  enabled: true
+kubeControllerManager:
+  enabled: true
+kubeScheduler:
+  enabled: true
+kubeProxy:
+  enabled: true
+
+---
+# Instructions for NKP Clusters:
+#
+# 1. Enable bin packing scheduler profile first:
+#    ./nkp-platform-bin-packing.sh enable
+#
+# 2. Update schedulerName values above to:
+#    schedulerName: "platform-services"
+#
+# 3. Install with:
+#    helm install prometheus prometheus-community/kube-prometheus-stack \
+#      -n monitoring \
+#      --create-namespace \
+#      -f prometheus-bin-packing-example.yaml
+#
+# 4. Verify bin packing is working:
+#    kubectl get pods -n monitoring -o wide
+#    # Pods should concentrate on fewer nodes
+#
+# 5. Monitor node utilization:
+#    kubectl top nodes
+#    # Should see higher utilization on nodes with Prometheus pods
